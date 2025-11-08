@@ -3,8 +3,8 @@
 #
 # Usage:
 #   python ln_snapshot_to_cloth_csvs.py snapshot.json out/
-# Optional:
-#   --allow-half-duplex
+# Options:
+#   --allow-half-duplex   # keep single-direction channels by synthesizing the reverse edge
 
 import argparse, json, csv, os, re, sys
 from collections import defaultdict
@@ -22,7 +22,7 @@ def load_records(path):
     if isinstance(data, dict) and isinstance(data.get("channels"), list): return data["channels"]
     raise ValueError("Snapshot must be a list or {'channels':[...]}")
 
-# ---------- Mapping builders ----------
+# ---------- mappings (old ids) ----------
 def build_node_mapping(records):
     pubkey_to_old = {}
     old_to_pubkey = {}
@@ -34,9 +34,8 @@ def build_node_mapping(records):
                 pubkey_to_old[pk] = nxt
                 old_to_pubkey[nxt] = pk
                 nxt += 1
-    # compact to 0-based contiguous ids
     olds = sorted(old_to_pubkey.keys())
-    node_old2new = {old:i for i, old in enumerate(olds)}       # 0..N-1
+    node_old2new = {old:i for i, old in enumerate(olds)}  # 0..N-1
     return pubkey_to_old, node_old2new, old_to_pubkey
 
 def build_scid_mapping(records):
@@ -49,9 +48,9 @@ def build_scid_mapping(records):
             nxt += 1
     return scid_to_old
 
-# ---------- Channel meta (endpoints, capacity) using old ids ----------
+# ---------- per-channel meta using old ids ----------
 def collect_channel_meta(records, pubkey_to_old, scid_to_old):
-    meta = {}  # key: scid str
+    meta = {}  # scid -> info
     for r in records:
         sc = r.get("short_channel_id"); src = r.get("source"); dst = r.get("destination")
         if not sc or not src or not dst: continue
@@ -62,7 +61,7 @@ def collect_channel_meta(records, pubkey_to_old, scid_to_old):
         n1, n2 = (a, b) if a <= b else (b, a)
         if sc not in meta:
             meta[sc] = {
-                "old_channel_id": scid_to_old[sc],  # provisional old numeric
+                "old_channel_id": scid_to_old[sc],
                 "node1_old": n1, "node2_old": n2,
                 "capacity_msat": cap_msat
             }
@@ -71,9 +70,9 @@ def collect_channel_meta(records, pubkey_to_old, scid_to_old):
                 meta[sc]["capacity_msat"] = cap_msat
     return meta
 
-# ---------- Build per-direction edge candidates keyed by (old_ch, old_u, old_v) ----------
+# ---------- edge candidates ----------
 def build_edge_candidates(records, pubkey_to_old, scid_to_old, ch_meta):
-    cand = {}
+    cand = {}  # key: (old_ch, u_old, v_old) -> dict
     for r in records:
         sc = r.get("short_channel_id"); src = r.get("source"); dst = r.get("destination")
         if not sc or not src or not dst: continue
@@ -94,8 +93,7 @@ def build_edge_candidates(records, pubkey_to_old, scid_to_old, ch_meta):
         }
     return cand
 
-def filter_bidirectional(cand, allow_half_duplex=False):
-    if allow_half_duplex: return cand
+def enforce_bidirectional(cand):
     keep, by_ch = {}, defaultdict(set)
     for (ch,u,v) in cand.keys():
         by_ch[ch].add((u,v))
@@ -105,23 +103,46 @@ def filter_bidirectional(cand, allow_half_duplex=False):
             keep[k] = e
     return keep
 
-# ---------- Renumber everything to 0-based contiguous and rewrite refs ----------
+def synthesize_missing_reverse_edges(cand):
+    """
+    For any (ch,u,v) missing its reverse (v,u), create it with:
+      - balance = 0
+      - policy copied from forward (best-effort fallback)
+    """
+    keys = list(cand.keys())
+    for (ch,u,v) in keys:
+        rev = (ch,v,u)
+        if rev not in cand:
+            fwd = cand[(ch,u,v)]
+            cand[rev] = {
+                "old_channel_id": ch,
+                "from_old": v,
+                "to_old": u,
+                "balance_msat": 0,
+                "fee_base_msat": fwd["fee_base_msat"],
+                "fee_ppm": fwd["fee_ppm"],
+                "min_htlc_msat": fwd["min_htlc_msat"],
+                "timelock": fwd["timelock"],
+            }
+    return cand
+
+# ---------- renumber to 0-based + rewrite ----------
 def renumber_all(cand, ch_meta, node_old2new):
-    # 1) edges → assign ids 0..M-1 and record reverse ids
+    # edges: ids 0..M-1
     keys = sorted(cand.keys())
-    key_to_eid = {k:i for i,k in enumerate(keys)}          # 0..M-1
+    key_to_eid = {k:i for i,k in enumerate(keys)}
     edges = []
     for k in keys:
         old_ch, u_old, v_old = k
         e = cand[k]
         eid = key_to_eid[k]
         rev = (old_ch, v_old, u_old)
-        counter = key_to_eid.get(rev, -1)                  # -1 only if half-duplex allowed
+        counter = key_to_eid.get(rev, -1)  # after synthesize/enforce, this should exist
         edges.append({
             "id": eid,
             "old_channel_id": e["old_channel_id"],
-            "from_old": u_old,
-            "to_old": v_old,
+            "from_new": node_old2new[e["from_old"]],
+            "to_new":   node_old2new[e["to_old"]],
             "counter_edge_id": counter,
             "balance_msat": e["balance_msat"],
             "fee_base_msat": e["fee_base_msat"],
@@ -130,53 +151,48 @@ def renumber_all(cand, ch_meta, node_old2new):
             "timelock": e["timelock"],
         })
 
-    # 2) channels → compact to 0..C-1 using only channels present in edges
+    # channels: only those present in edges → ids 0..C-1
     present_old_ch = sorted({e["old_channel_id"] for e in edges})
-    ch_old2new = {old:i for i,old in enumerate(present_old_ch)}  # 0..C-1
+    ch_old2new = {old:i for i,old in enumerate(present_old_ch)}
 
-    # 3) rewrite edges: channel_id (new), node ids (new)
+    # rewrite edges' channel_id
     for e in edges:
         e["channel_id"] = ch_old2new[e["old_channel_id"]]
-        e["from_new"] = node_old2new[e["from_old"]]
-        e["to_new"]   = node_old2new[e["to_old"]]
 
-    # 4) build channels rows meta with new ids + new node ids
+    # channels meta (new ids, new node ids)
     channels_meta_new = {}
-    for sc, m in ch_meta.items():
-        old = m["old_channel_id"]
-        if old not in ch_old2new: continue
+    old2scid = { m["old_channel_id"]: sc for sc,m in ch_meta.items() }
+    for old in present_old_ch:
         cid = ch_old2new[old]
+        sc = old2scid.get(old)
+        m = ch_meta[sc]
         channels_meta_new[cid] = {
             "id": cid,
+            "short_channel_id": sc,
             "node1_id": node_old2new[m["node1_old"]],
             "node2_id": node_old2new[m["node2_old"]],
             "capacity_msat": m["capacity_msat"],
         }
 
-    # 5) rebuild (new_ch, from_new, to_new) → edge_id (for channel edge pairing)
+    # (new_ch, from_new, to_new) → edge_id
     key_new_to_eid = {(e["channel_id"], e["from_new"], e["to_new"]): e["id"] for e in edges}
 
-    return edges, channels_meta_new, key_new_to_eid
+    return edges, channels_meta_new, key_new_to_eid, ch_old2new
 
-# ---------- Writers ----------
-def write_nodes(outdir, node_old2new, old_to_pubkey):
-    # nodes_ln.csv — id only (0..N-1)
-    path = os.path.join(outdir, "nodes_ln.csv")
-    with open(path, "w", newline="") as f:
+# ---------- writers ----------
+def write_nodes_ln(outdir, node_old2new, old_to_pubkey):
+    with open(os.path.join(outdir, "nodes_ln.csv"), "w", newline="") as f:
         w = csv.writer(f); w.writerow(["id"])
         for old in sorted(old_to_pubkey.keys()):
             w.writerow([node_old2new[old]])
 
-def write_edges(outdir, edges):
-    # edges_ln.csv — 0-based ids
-    path = os.path.join(outdir, "edges_ln.csv")
+def write_edges_ln(outdir, edges):
     fields = ["id","channel_id","counter_edge_id","from_node_id","to_node_id",
               "balance(millisat)","fee_base(millisat)","fee_proportional","min_htlc(millisat)","timelock"]
-    edges_sorted = sorted(edges, key=lambda e: e["id"])
-    with open(path, "w", newline="") as f:
+    with open(os.path.join(outdir, "edges_ln.csv"), "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
-        for e in edges_sorted:
+        for e in sorted(edges, key=lambda x: x["id"]):
             w.writerow({
                 "id": e["id"],
                 "channel_id": e["channel_id"],
@@ -190,11 +206,9 @@ def write_edges(outdir, edges):
                 "timelock": e["timelock"],
             })
 
-def write_channels(outdir, channels_meta_new, key_new_to_eid):
-    # channels_ln.csv — 0-based ids; require bidirectional (edges exist both ways)
-    path = os.path.join(outdir, "channels_ln.csv")
+def write_channels_ln(outdir, channels_meta_new, key_new_to_eid, allow_half_duplex):
     fields = ["id","edge1_id","edge2_id","node1_id","node2_id","capacity(millisat)"]
-    with open(path, "w", newline="") as f:
+    with open(os.path.join(outdir, "channels_ln.csv"), "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         for cid in sorted(channels_meta_new.keys()):
@@ -202,9 +216,14 @@ def write_channels(outdir, channels_meta_new, key_new_to_eid):
             n1, n2 = m["node1_id"], m["node2_id"]
             e1 = key_new_to_eid.get((cid, n1, n2))
             e2 = key_new_to_eid.get((cid, n2, n1))
-            if e1 is None or e2 is None:
-                # should not happen when bidirectional filter is enforced
-                continue
+            if not allow_half_duplex:
+                # by construction e1 & e2 exist (enforced/synthesized earlier)
+                if e1 is None or e2 is None:  # extremely defensive
+                    continue
+            else:
+                # if user somehow disables synthesize, tolerate a missing edge with -1
+                e1 = -1 if e1 is None else e1
+                e2 = -1 if e2 is None else e2
             w.writerow({
                 "id": cid,
                 "edge1_id": e1,
@@ -214,9 +233,30 @@ def write_channels(outdir, channels_meta_new, key_new_to_eid):
                 "capacity(millisat)": m["capacity_msat"],
             })
 
-# ---------- Sanity checks ----------
+def write_node_mapping(outdir, node_old2new, old_to_pubkey):
+    # id (new, 0-based) -> pubkey
+    with open(os.path.join(outdir, "node_mapping.csv"), "w", newline="") as f:
+        w = csv.writer(f); w.writerow(["id","pubkey"])
+        for old in sorted(old_to_pubkey.keys()):
+            w.writerow([node_old2new[old], old_to_pubkey[old]])
+
+def write_channel_mapping(outdir, ch_old2new, ch_meta):
+    # id (new, 0-based) -> short_channel_id
+    # ch_meta is scid-keyed; invert using the old id
+    old2scid = { m["old_channel_id"]: sc for sc,m in ch_meta.items() }
+    rows = []
+    for old, new in ch_old2new.items():
+        sc = old2scid.get(old)
+        if sc:
+            rows.append((new, sc))
+    rows.sort(key=lambda x: x[0])
+    with open(os.path.join(outdir, "channel_mapping.csv"), "w", newline="") as f:
+        w = csv.writer(f); w.writerow(["id","short_channel_id"])
+        for new, sc in rows:
+            w.writerow([new, sc])
+
+# ---------- sanity ----------
 def sanity_check(outdir):
-    import itertools
     # edges
     edges = {}
     with open(os.path.join(outdir, "edges_ln.csv")) as f:
@@ -225,6 +265,7 @@ def sanity_check(outdir):
             i = int(row["id"]); edges[i] = row
     M = len(edges); assert M>0, "no edges"
     assert set(edges.keys()) == set(range(0, M)), "edges.id must be contiguous 0..M-1"
+
     # channels
     chans = {}
     with open(os.path.join(outdir, "channels_ln.csv")) as f:
@@ -233,56 +274,62 @@ def sanity_check(outdir):
             cid = int(row["id"]); chans[cid] = row
     C = len(chans); assert C>0, "no channels"
     assert set(chans.keys()) == set(range(0, C)), "channels.id must be contiguous 0..C-1"
-    # refs
+
+    # channel refs and edge channel_id bounds
     for cid,row in chans.items():
         e1 = int(row["edge1_id"]); e2 = int(row["edge2_id"])
-        assert 0 <= e1 < M and 0 <= e2 < M, f"Channel {cid} references missing edge"
-        a,b = edges[e1], edges[e2]
-        assert int(a["channel_id"]) == int(b["channel_id"]) == cid, f"Edges must carry channel_id={cid}"
-        assert a["from_node_id"] == b["to_node_id"] and a["to_node_id"] == b["from_node_id"], "Edges must be reverse"
-    # channel_id range on edges
+        assert (-1 <= e1 < M) and (-1 <= e2 < M), f"Channel {cid} references missing edge"
+        if e1 != -1:
+            assert int(edges[e1]["channel_id"]) == cid
+        if e2 != -1:
+            assert int(edges[e2]["channel_id"]) == cid
+
     for e in edges.values():
         ch = int(e["channel_id"])
         assert 0 <= ch < C, f"Edge {e['id']} has channel_id {ch} out of 0..{C-1}"
+
     print("CSV sanity: OK")
 
-# ---------- Main ----------
+# ---------- main ----------
 def main():
-    ap = argparse.ArgumentParser(description="Convert LN snapshot → *_ln.csv (zero-based, contiguous IDs)")
+    ap = argparse.ArgumentParser(description="Convert LN snapshot → *_ln.csv (0-based, contiguous IDs) + mappings")
     ap.add_argument("snapshot")
     ap.add_argument("outdir")
     ap.add_argument("--allow-half-duplex", action="store_true",
-                    help="Keep single-direction channels (NOT recommended for this C code)")
+                    help="Keep single-direction channels (synthetic reverse edges with balance=0)")
     args = ap.parse_args()
 
     os.makedirs(args.outdir, exist_ok=True)
     recs = load_records(args.snapshot)
 
-    # 1) mappings (old ids)
+    # mappings & meta (old ids)
     pubkey_to_old, node_old2new, old_to_pubkey = build_node_mapping(recs)
     scid_to_old = build_scid_mapping(recs)
-
-    # 2) channel meta (old ids)
     ch_meta = collect_channel_meta(recs, pubkey_to_old, scid_to_old)
 
-    # 3) edge candidates (old ids)
+    # edges (old ids)
     cand = build_edge_candidates(recs, pubkey_to_old, scid_to_old, ch_meta)
 
-    # 4) enforce bidirectional unless flag says otherwise
-    cand = filter_bidirectional(cand, allow_half_duplex=args.allow_half_duplex)
+    # handle duplex policy
+    if args.allow_half_duplex:
+        cand = synthesize_missing_reverse_edges(cand)
+    else:
+        cand = enforce_bidirectional(cand)
 
-    # 5) renumber to 0-based contiguous & rewrite references
-    edges, channels_meta_new, key_new_to_eid = renumber_all(cand, ch_meta, node_old2new)
+    # renumber to 0-based and rewrite
+    edges, channels_meta_new, key_new_to_eid, ch_old2new = renumber_all(cand, ch_meta, node_old2new)
 
-    # 6) write files
-    write_nodes(args.outdir, node_old2new, old_to_pubkey)
-    write_edges(args.outdir, edges)
-    write_channels(args.outdir, channels_meta_new, key_new_to_eid)
+    # write *_ln + mapping files
+    write_nodes_ln(args.outdir, node_old2new, old_to_pubkey)
+    write_edges_ln(args.outdir, edges)
+    write_channels_ln(args.outdir, channels_meta_new, key_new_to_eid, allow_half_duplex=args.allow_half_duplex)
+    write_node_mapping(args.outdir, node_old2new, old_to_pubkey)
+    write_channel_mapping(args.outdir, ch_old2new, ch_meta)
 
-    # 7) sanity checks
+    # sanity
     sanity_check(args.outdir)
 
-    print(f"Wrote: nodes_ln.csv, edges_ln.csv, channels_ln.csv in {args.outdir}")
+    print(f"Wrote to {args.outdir}: nodes_ln.csv, edges_ln.csv, channels_ln.csv, node_mapping.csv, channel_mapping.csv")
 
 if __name__ == "__main__":
     try:

@@ -57,7 +57,7 @@ data/edges_ln.csv
 data/channels_ln.csv
 data/channel_mapping.csv
 payments.csv
-
+.idea/
 outchannels_output.csv
 outedges_output.csv
 outnodes_output.csv
