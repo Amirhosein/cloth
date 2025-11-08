@@ -50,3 +50,16 @@ modules.order
 Module.symvers
 Mkfile.old
 dkms.conf
+cloth
+data/nodes_ln.csv
+data/node_mapping.csv
+data/edges_ln.csv
+data/channels_ln.csv
+data/channel_mapping.csv
+payments.csv
+
+outchannels_output.csv
+outedges_output.csv
+outnodes_output.csv
+outpayments_output.csv
+listchannels20220412.json
