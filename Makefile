@@ -1,11 +1,51 @@
-#include makefile.variable
+# ===== Build settings (macOS-friendly) =====
+# On macOS, "gcc" is clang; use clang explicitly.
+CC       := clang
+STD      := -std=c11
+WARN     := -Wall -Wextra -Wpedantic
+THREADS  := -pthread
+PKG_GSL  := $(shell pkg-config --cflags --libs gsl)
 
-LIBS=-lgsl -lgslcblas -lm 
-#INCLUDES=-I$(ipath)include/json-c -I$(ipath)include/gsl -I$(ipath)include/
+# DEBUG=1 enables ASan/UBSan + symbols; DEBUG=0 for optimized release
+DEBUG    ?= 1
 
-build:
-	gcc -g -pthread -o cloth ./src/cloth.c ./src/heap.c ./src/array.c ./src/list.c ./src/event.c ./src/payments.c ./src/htlc.c ./src/routing.c ./src/network.c ./src/utils.c $(LIBS)
-run:
-	GSL_RNG_SEED=1992  ./cloth
-clear:
-	rm -r ./*.o
+ifeq ($(DEBUG),1)
+  OPTS   := -O0 -g
+  SAN    := -fsanitize=address,undefined -fno-omit-frame-pointer
+else
+  OPTS   := -O2
+  SAN    :=
+endif
+
+CFLAGS   := $(STD) $(WARN) $(THREADS) $(OPTS) $(SAN)
+LDFLAGS  := $(THREADS) $(SAN) $(PKG_GSL)
+
+SRC := \
+  ./src/cloth.c \
+  ./src/heap.c \
+  ./src/array.c \
+  ./src/list.c \
+  ./src/event.c \
+  ./src/payments.c \
+  ./src/htlc.c \
+  ./src/routing.c \
+  ./src/network.c \
+  ./src/utils.c
+
+BIN := cloth
+
+.PHONY: all build run clean
+
+all: build
+
+build: $(BIN)
+
+$(BIN): $(SRC)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+# Example: make run SEED=1992 OUT=./out
+run: build
+	./run-simulation.sh $(SEED) $(OUT)
+
+clean:
+	rm -f $(BIN)
