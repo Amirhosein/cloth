@@ -18,6 +18,8 @@ Usage examples:
     python generate_payments.py -n 10 --min-amount 1000 --max-amount 2500 --amount-colname "amount(millisat)" --output /tmp/payments.csv
     python generate_payments.py -n 50 --min-amount 50 --max-amount 500 --start-mode epoch --step-min 5 --step-max 45 --seed 123
 
+
+    python3 generate_payments.py -n 10000 --min-amount 10000000 --max-amount 100000000 --output payments/payments0.csv
 """
 import argparse
 import csv
@@ -33,8 +35,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output", type=str, default="payments_generated.csv", help="Output CSV path.")
     p.add_argument("--amount-colname", type=str, default="amount", help='Amount column name. Use "amount(millisat)" to mirror your template.')
     p.add_argument("--id-start", type=int, default=0, help="Starting id (defaults to 0).")
-    p.add_argument("--sender-range", type=int, nargs=2, metavar=("MIN", "MAX"), default=[1, 20000], help="Sender id range [MIN, MAX].")
-    p.add_argument("--receiver-range", type=int, nargs=2, metavar=("MIN", "MAX"), default=[1, 20000], help="Receiver id range [MIN, MAX].")
+    p.add_argument("--sender-range", type=int, nargs=2, metavar=("MIN", "MAX"), default=[1, 2000], help="Sender id range [MIN, MAX].")
+    p.add_argument("--receiver-range", type=int, nargs=2, metavar=("MIN", "MAX"), default=[1, 2000], help="Receiver id range [MIN, MAX].")
     p.add_argument("--distinct-parties", action="store_true", help="Ensure sender_id != receiver_id.")
     p.add_argument("--start-mode", choices=["relative", "epoch"], default="relative", help="How to generate start_time values.")
     p.add_argument("--start-base", type=int, default=0, help="Base start_time for relative mode (ignored for epoch mode).")
