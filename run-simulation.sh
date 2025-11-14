@@ -29,3 +29,5 @@ echo "Running cloth with GSL_RNG_SEED=${GSL_RNG_SEED}, OUTDIR=${OUTDIR}"
   read -r -p "Press Enter to close..."
   exit "${status}"
 }
+
+python batch-means.py "${OUTDIR}"

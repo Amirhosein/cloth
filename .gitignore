@@ -63,3 +63,17 @@ outedges_output.csv
 outnodes_output.csv
 outpayments_output.csv
 listchannels20220412.json
+
+#Amir files
+.venv
+.DS_Store
+outcloth_output.json
+payments/*
+out/*
+out1/*
+out2/*
+out3/*
+out4/*
+out5/*
+out6/*
+out7/*

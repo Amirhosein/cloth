@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 # ln_snapshot_to_cloth_csvs.py
 #
+# I have a question here:
+# python3 -m venv .venv
+# source .venv/bin/activate
+#
 # Usage:
-#   python ln_snapshot_to_cloth_csvs.py snapshot.json out/
+#   python clothify.py snapshot.json data/
 # Options:
 #   --allow-half-duplex   # keep single-direction channels by synthesizing the reverse edge
 
