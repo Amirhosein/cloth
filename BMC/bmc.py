@@ -38,7 +38,7 @@ def build_ln_graph(channels: Iterable[dict], use_only_active: bool = True) -> nx
 
     Nodes: node ids (strings).
     Edges: directed from 'source' to 'destination'.
-           Edge weight is 1 by default (shortest path defined by hop count).
+           Edge weight is 1 by default (shortest paths by hop count).
 
     You can later change edge weights to fees or any custom metric.
     """
@@ -70,183 +70,119 @@ def build_ln_graph(channels: Iterable[dict], use_only_active: bool = True) -> nx
     return G
 
 
-def build_paths_universe(
-        G: nx.DiGraph,
-        use_all_shortest_paths: bool = False,
-        max_sources: int = None,
-) -> Tuple[List[Dict[str, Any]], Dict[Any, List[int]]]:
+def compute_node_costs_from_channels(
+        channels: Iterable[dict],
+        use_only_active: bool = True,
+) -> Dict[Any, float]:
     """
-    Build the universe of paths and the mapping from node -> list of path indices.
+    Compute cost for each node as the sum of half the capacity of its incident channels.
 
-    For each ordered pair (s, t), s != t:
-      - If use_all_shortest_paths is False:
-          use one shortest path from NetworkX.
-      - If use_all_shortest_paths is True:
-          use all shortest paths between s and t.
+    For each channel with 'satoshis' = C between u and v:
+      cost[u] += C / 2
+      cost[v] += C / 2
 
-    Returns:
-      paths: list of dicts:
-        - 'nodes': list of nodes on the path [s, ..., t]
-        - 'weight': weight of this path (traffic weight)
-      node_to_paths: dict node -> list of indices into paths where this node
-                     appears as an internal node (not s, not t).
+    This approximates how much capital the node put into the network.
     """
-    nodes = list(G.nodes())
-    if max_sources is not None:
-        nodes = nodes[:max_sources]
+    cost: Dict[Any, float] = {}
 
-    paths: List[Dict[str, Any]] = []
-    node_to_paths: Dict[Any, List[int]] = {v: [] for v in G.nodes()}
+    for ch in channels:
+        if use_only_active and not ch.get("active", True):
+            continue
 
-    for s in nodes:
-        sp_dict = nx.single_source_shortest_path(G, s)
-        for t, one_path in sp_dict.items():
-            if t == s:
-                continue
+        u = ch["source"]
+        v = ch["destination"]
+        satoshis = ch.get("satoshis")
 
-            if use_all_shortest_paths:
-                all_paths = list(nx.all_shortest_paths(G, s, t))
-                if not all_paths:
-                    continue
-                weight_per_path = 1.0 / len(all_paths)
-                for p in all_paths:
-                    idx = len(paths)
-                    paths.append({"nodes": p, "weight": weight_per_path})
-                    # only internal nodes
-                    for v in p[1:-1]:
-                        node_to_paths[v].append(idx)
-            else:
-                p = one_path
-                idx = len(paths)
-                paths.append({"nodes": p, "weight": 1.0})
-                for v in p[1:-1]:
-                    node_to_paths[v].append(idx)
+        if satoshis is None:
+            continue
 
-    return paths, node_to_paths
+        half = float(satoshis) / 2.0
+
+        cost[u] = cost.get(u, 0.0) + half
+        cost[v] = cost.get(v, 0.0) + half
+
+    return cost
 
 
-def greedy_budgeted_max_coverage(
-        node_to_paths: Dict[Any, List[int]],
-        paths: List[Dict[str, Any]],
+def compute_betweenness(G: nx.DiGraph, use_edge_weights: bool = False) -> Dict[Any, float]:
+    """
+    Compute betweenness centrality for each node using Brandes algorithm.
+
+    If use_edge_weights is False:
+      shortest paths are based on hop count.
+
+    If use_edge_weights is True:
+      shortest paths use the 'weight' attribute of edges.
+    """
+    if use_edge_weights:
+        return nx.betweenness_centrality(G, weight="weight", normalized=False)
+    else:
+        # ignore edge weights, use unweighted shortest paths
+        return nx.betweenness_centrality(G, weight=None, normalized=False)
+
+
+def greedy_budgeted_max_value(
+        value: Dict[Any, float],
         cost: Dict[Any, float],
         budget: float,
-) -> Tuple[Set[Any], float]:
+) -> Tuple[Set[Any], float, float]:
     """
-    Greedy algorithm for Budgeted Maximum Coverage similar to Khuller et al.
+    Simple greedy knapsack style selection:
 
-    At each step it picks the node with maximum marginal gain per unit cost,
-    under a knapsack style budget constraint.
+      - value[v]: betweenness of node v
+      - cost[v]: cost of node v
+      - budget: total budget
+
+    Strategy:
+      - sort nodes by value / cost ratio in descending order
+      - iterate and pick a node if it fits in remaining budget
 
     Returns:
-      chosen_nodes: set of nodes selected by the algorithm
-      total_coverage: sum of weights of covered paths
+      chosen_nodes: set of chosen nodes
+      total_value: sum of value[v] for chosen nodes
+      total_cost: sum of cost[v] for chosen nodes
     """
-    num_paths = len(paths)
-    covered = [False] * num_paths
+    # build list of candidates (skip nodes with zero cost or zero value)
+    items = []
+    for v in value:
+        v_cost = cost.get(v, 0.0)
+        v_value = value[v]
+        if v_cost <= 0 or v_value <= 0:
+            continue
+        ratio = v_value / v_cost
+        items.append((v, v_value, v_cost, ratio))
+
+    # sort by ratio descending
+    items.sort(key=lambda x: x[3], reverse=True)
+
     chosen: Set[Any] = set()
     remaining_budget = float(budget)
+    total_value = 0.0
+    total_cost = 0.0
 
-    # Track best single node solution
-    best_single_node = None
-    best_single_gain = 0.0
+    for v, v_value, v_cost, ratio in items:
+        if v_cost <= remaining_budget:
+            chosen.add(v)
+            remaining_budget -= v_cost
+            total_value += v_value
+            total_cost += v_cost
 
-    for v, p_list in node_to_paths.items():
-        if cost.get(v, float("inf")) > budget:
-            continue
-        gain = 0.0
-        for p_idx in p_list:
-            gain += paths[p_idx]["weight"]
-        if gain > best_single_gain:
-            best_single_gain = gain
-            best_single_node = v
-
-    # Greedy iterations based on marginal gain / cost
-    while True:
-        best_v = None
-        best_ratio = 0.0
-        best_gain = 0.0
-
-        for v, p_list in node_to_paths.items():
-            if v in chosen:
-                continue
-            c = cost.get(v, float("inf"))
-            if c > remaining_budget:
-                continue
-
-            gain = 0.0
-            for p_idx in p_list:
-                if not covered[p_idx]:
-                    gain += paths[p_idx]["weight"]
-
-            if gain <= 0.0:
-                continue
-
-            ratio = gain / c
-            if ratio > best_ratio:
-                best_ratio = ratio
-                best_gain = gain
-                best_v = v
-
-        if best_v is None:
-            break
-
-        chosen.add(best_v)
-        remaining_budget -= cost[best_v]
-        for p_idx in node_to_paths[best_v]:
-            covered[p_idx] = True
-
-    greedy_value = 0.0
-    for p_idx, is_cov in enumerate(covered):
-        if is_cov:
-            greedy_value += paths[p_idx]["weight"]
-
-    # Compare greedy with best single node
-    if best_single_node is not None and best_single_gain > greedy_value:
-        return {best_single_node}, best_single_gain
-    else:
-        return chosen, greedy_value
-
-
-def evaluate_coverage(
-        node_set: Iterable[Any],
-        node_to_paths: Dict[Any, List[int]],
-        paths: List[Dict[str, Any]],
-) -> float:
-    """
-    Compute total coverage (sum of path weights) for a given set of nodes.
-    """
-    covered = [False] * len(paths)
-    for v in node_set:
-        for p_idx in node_to_paths.get(v, []):
-            covered[p_idx] = True
-
-    total = 0.0
-    for p_idx, is_cov in enumerate(covered):
-        if is_cov:
-            total += paths[p_idx]["weight"]
-    return total
-
-
-def uniform_node_costs(G: nx.DiGraph, cost_value: float = 1.0) -> Dict[Any, float]:
-    """
-    Assign the same cost to every node.
-    """
-    return {v: float(cost_value) for v in G.nodes()}
+    return chosen, total_value, total_cost
 
 
 if __name__ == "__main__":
     """
     Example usage:
 
-      python ln_attack_sim.py snapshot.json 10
+      python ln_budget_attack.py snapshot.json 1e9
 
-    Here 10 is the adversary budget.
-    With uniform node costs this means you can buy at most 10 nodes.
+    where 1e9 is the adversary budget in satoshis.
     """
     import sys
+    import time
 
     if len(sys.argv) < 3:
-        print("Usage: python ln_attack_sim.py <snapshot.json> <budget>")
+        print("Usage: python ln_budget_attack.py <snapshot.json> <budget_in_satoshis>")
         sys.exit(1)
 
     snapshot_path = sys.argv[1]
@@ -260,24 +196,30 @@ if __name__ == "__main__":
     G = build_ln_graph(channels, use_only_active=True)
     print(f"Graph has {G.number_of_nodes()} nodes and {G.number_of_edges()} edges")
 
-    print("Building paths universe (this can be expensive)...")
-    paths, node_to_paths = build_paths_universe(
-        G,
-        use_all_shortest_paths=False,  # set True for exact group betweenness style
-        max_sources=None,
-    )
-    print(f"Constructed {len(paths)} paths in the universe")
+    print("Computing node costs from channel capacities...")
+    node_cost = compute_node_costs_from_channels(channels, use_only_active=True)
+    print(f"Computed costs for {len(node_cost)} nodes")
 
-    print("Assigning node costs (uniform)...")
-    cost = uniform_node_costs(G, cost_value=1.0)
+    print("Computing betweenness centrality (Brandes)...")
+    t0 = time.perf_counter()
+    bet = compute_betweenness(G, use_edge_weights=False)
+    t1 = time.perf_counter()
+    print(f"Betweenness computed for all nodes in {t1 - t0:.2f} seconds")
 
-    print("Running greedy budgeted max coverage...")
-    chosen_nodes, total_cov = greedy_budgeted_max_coverage(
-        node_to_paths, paths, cost, budget
+    total_bet_all = sum(bet.values())
+    print(f"Total betweenness over all nodes: {total_bet_all}")
+
+    print("Running greedy budgeted max value selection...")
+    chosen_nodes, total_value, total_cost = greedy_budgeted_max_value(
+        bet, node_cost, budget
     )
+
+    frac = total_value / total_bet_all if total_bet_all > 0 else 0.0
 
     print(f"Chosen {len(chosen_nodes)} nodes under budget {budget}")
-    print(f"Total covered path weight: {total_cov}")
+    print(f"Total chosen cost: {total_cost}")
+    print(f"Total betweenness of chosen nodes: {total_value}")
+    print(f"Fraction of total betweenness captured: {frac:.4f} ({frac * 100:.2f}%)")
 
     print("Adversary should buy these nodes:")
     for v in chosen_nodes:
