@@ -84,7 +84,7 @@ def build_edge_candidates(records, pubkey_to_old, scid_to_old, ch_meta):
         u = pubkey_to_old.get(src); v = pubkey_to_old.get(dst)
         if not old_ch or not u or not v: continue
         cap_msat = ch_meta.get(sc, {}).get("capacity_msat", 0)
-        half_msat = cap_msat // 2 if cap_msat else 0
+        half_msat = cap_msat // 2 if cap_msat else 0 ####what?
         cand[(old_ch, u, v)] = {
             "old_channel_id": old_ch,
             "from_old": u,
@@ -122,7 +122,7 @@ def synthesize_missing_reverse_edges(cand):
                 "old_channel_id": ch,
                 "from_old": v,
                 "to_old": u,
-                "balance_msat": 0,
+                "balance_msat": 100000, ####what?, I changed from 0 to 100000 for testing.
                 "fee_base_msat": fwd["fee_base_msat"],
                 "fee_ppm": fwd["fee_ppm"],
                 "min_htlc_msat": fwd["min_htlc_msat"],
@@ -315,7 +315,8 @@ def main():
     cand = build_edge_candidates(recs, pubkey_to_old, scid_to_old, ch_meta)
 
     # handle duplex policy
-    if args.allow_half_duplex:
+    # Not is for having all edges now...
+    if not args.allow_half_duplex:
         cand = synthesize_missing_reverse_edges(cand)
     else:
         cand = enforce_bidirectional(cand)

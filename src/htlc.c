@@ -24,7 +24,7 @@
 
 /* AUXILIARY FUNCTIONS */
 
-/* compute the fees to be paid to a hop for forwarding the payment */ 
+/* compute the fees to be paid to a hop for forwarding the payment */
 uint64_t compute_fee(uint64_t amount_to_forward, struct policy policy) {
   uint64_t fee;
   fee = (policy.fee_proportional*amount_to_forward) / 1000000;
@@ -147,7 +147,11 @@ void process_success_result(struct node* node, struct payment *payment, uint64_t
   }
 }
 
-/* process a payment which failed (different processments depending on the error type) */
+//
+// //
+// // //
+// process a payment which failed (different processments depending on the error type)
+/*
 void process_fail_result(struct node* node, struct payment *payment, uint64_t current_time){
   struct route_hop* hop, *error_hop;
   int i;
@@ -174,7 +178,63 @@ void process_fail_result(struct node* node, struct payment *payment, uint64_t cu
     }
   }
 }
+*/
+//EDITED BY AMIR
+/* process a payment which failed (different processes depending on the error type) */
+void process_fail_result(struct node* node, struct payment *payment, uint64_t current_time){
+  struct route_hop *hop = NULL, *error_hop = NULL;
+  struct array* route_hops = NULL;
+  int i, len;
 
+  if (!node || !payment) return;
+
+  error_hop = payment->error.hop;
+
+  /* If we don't know the hop (e.g., NOROUTE before sending), there's nothing to update. */
+  if (!error_hop) return;
+
+  /* Do nothing if the error was originated by the sender (no debit happened). */
+  if (error_hop->from_node_id == payment->sender) return;
+
+  if (payment->error.type == OFFLINENODE) {
+    /* Guard against missing fields just in case. */
+    set_node_pair_result_fail(node->results, error_hop->from_node_id, error_hop->to_node_id, 0, current_time);
+    set_node_pair_result_fail(node->results, error_hop->to_node_id, error_hop->from_node_id, 0, current_time);
+    return;
+  }
+
+  if (payment->error.type == NOBALANCE) {
+    if (!payment->route) return;
+    route_hops = payment->route->route_hops;
+    if (!route_hops) return;
+
+    len = array_len(route_hops);
+    for (i = 0; i < len; i++) {
+      hop = array_get(route_hops, i);
+      if (!hop) continue;
+
+      if (hop->edge_id == error_hop->edge_id) {
+        /* Mark the failing edge and stop. */
+        set_node_pair_result_fail(node->results,
+                                  hop->from_node_id,
+                                  hop->to_node_id,
+                                  hop->amount_to_forward,
+                                  current_time);
+        break;
+      }
+
+      /* Hops before the failing one succeeded. */
+      set_node_pair_result_success(node->results,
+                                   hop->from_node_id,
+                                   hop->to_node_id,
+                                   hop->amount_to_forward,
+                                   current_time);
+    }
+    return;
+  }
+
+  /* Other error types: conservatively do nothing. Add cases as needed. */
+}
 
 void generate_send_payment_event(struct payment* payment, struct array* path, struct simulation* simulation, struct network* network){
   struct route* route;
@@ -273,8 +333,57 @@ void send_payment(struct event* event, struct simulation* simulation, struct net
   payment = event->payment;
   route = payment->route;
   node = array_get(network->nodes, event->node_id);
+  //EDITED BY AMIRHOSEIN YARI
+  //first_route_hop = array_get(route->route_hops, 0);
+  //next_edge = array_get(network->edges, first_route_hop->edge_id);
+  //
+
+  /* --- BEGIN: safe route/edge setup --- */
+  if (!route) {
+    /* Optional: payment->error.type = NOROUTE; */
+    payment->error.hop = NULL;
+    next_event_time = simulation->current_time;
+    next_event = new_event(next_event_time, RECEIVEFAIL, event->node_id, event->payment);
+    simulation->events = heap_insert(simulation->events, next_event, compare_event);
+    return;
+  }
+
   first_route_hop = array_get(route->route_hops, 0);
+  if (!first_route_hop) {
+    /* Optional: payment->error.type = NOROUTE; */
+    payment->error.hop = NULL;
+    next_event_time = simulation->current_time;
+    next_event = new_event(next_event_time, RECEIVEFAIL, event->node_id, event->payment);
+    simulation->events = heap_insert(simulation->events, next_event, compare_event);
+    return;
+  }
+
   next_edge = array_get(network->edges, first_route_hop->edge_id);
+  if (!next_edge) {
+    /* Optional: payment->error.type = INVALIDROUTE; */
+    payment->error.hop = first_route_hop;
+    next_event_time = simulation->current_time;
+    next_event = new_event(next_event_time, RECEIVEFAIL, event->node_id, event->payment);
+    simulation->events = heap_insert(simulation->events, next_event, compare_event);
+    return;
+  }
+
+  /* If the edge isn't incident to this node, fail gracefully instead of exit(-1) */
+  if (!is_present(next_edge->id, node->open_edges)) {
+    fprintf(stderr,
+            "WARN (send_payment): edge %ld is not an edge of node %ld\n",
+            next_edge->id, node->id);
+    /* Optional: payment->error.type = INVALIDROUTE; */
+    payment->error.hop = first_route_hop;
+    next_event_time = simulation->current_time;
+    next_event = new_event(next_event_time, RECEIVEFAIL, event->node_id, event->payment);
+    simulation->events = heap_insert(simulation->events, next_event, compare_event);
+    return;
+  }
+  /* --- END: safe route/edge setup --- */
+  //
+  // //
+  // // //
 
   if(!is_present(next_edge->id, node->open_edges)) {
     printf("ERROR (send_payment): edge %ld is not an edge of node %ld \n", next_edge->id, node->id);
@@ -381,7 +490,7 @@ void forward_payment(struct event *event, struct simulation* simulation, struct 
   /* next_route_hop->edge_id = next_edge->id; */
   //END -- NON-STRICT FORWARDING
 
-  // STRICT FORWARDING 
+  // STRICT FORWARDING
   prev_edge = array_get(network->edges,previous_route_hop->edge_id);
   next_edge = array_get(network->edges, next_route_hop->edge_id);
   can_send_htlc = check_balance_and_policy(next_edge, prev_edge, previous_route_hop, next_route_hop);
@@ -505,7 +614,7 @@ void forward_fail(struct event* event, struct simulation* simulation, struct net
     exit(-1);
   }
 
-  /* since the payment failed, the balance must be brought back to the state before the payment occurred */ 
+  /* since the payment failed, the balance must be brought back to the state before the payment occurred */
   next_edge->balance += next_hop->amount_to_forward;
 
   prev_hop = get_route_hop(event->node_id, payment->route->route_hops, 0);
@@ -528,6 +637,8 @@ void receive_fail(struct event* event, struct simulation* simulation, struct net
   payment = event->payment;
   node = array_get(network->nodes, event->node_id);
 
+  //EDITED BY AMIRHOSEIN YARI
+  /*
   error_hop = payment->error.hop;
   if(error_hop->from_node_id != payment->sender){ // if the error occurred in the first hop, the balance hasn't to be updated, since it was not decreased
     first_hop = array_get(payment->route->route_hops, 0);
@@ -538,6 +649,32 @@ void receive_fail(struct event* event, struct simulation* simulation, struct net
     }
     next_edge->balance += first_hop->amount_to_forward;
   }
+  */
+
+  /* --- BEGIN defensive replacement for error_hop refund path --- */
+  error_hop = payment ? payment->error.hop : NULL;
+
+  /* If there's no specific hop (e.g., NOROUTE before sending), skip refund. */
+  if (error_hop && error_hop->from_node_id != payment->sender) {
+    /* Only refund if we actually have a first hop we debited earlier. */
+    first_hop = (payment && payment->route) ? array_get(payment->route->route_hops, 0) : NULL;
+    if (first_hop) {
+      next_edge = array_get(network->edges, first_hop->edge_id);
+      if (next_edge) {
+        if (!is_present(next_edge->id, node->open_edges)) {
+          printf("WARN (receive_fail): edge %ld is not an edge of node %ld\n",
+                 next_edge->id, node->id);
+        } else {
+          next_edge->balance += first_hop->amount_to_forward;
+        }
+      }
+    }
+  }
+  /* --- END defensive replacement for error_hop refund path --- */
+  //
+  // //
+  // // //
+
 
   process_fail_result(node, payment, simulation->current_time);
 
