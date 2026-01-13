@@ -4,7 +4,8 @@ CC       := clang
 STD      := -std=c11
 WARN     := -Wall -Wextra -Wpedantic
 THREADS  := -pthread
-PKG_GSL  := $(shell pkg-config --cflags --libs gsl)
+PKG_GSL_CFLAGS := $(shell pkg-config --cflags gsl)
+PKG_GSL_LIBS   := $(shell pkg-config --libs gsl)
 
 # DEBUG=1 enables ASan/UBSan + symbols; DEBUG=0 for optimized release
 DEBUG    ?= 1
@@ -17,8 +18,8 @@ else
   SAN    :=
 endif
 
-CFLAGS   := $(STD) $(WARN) $(THREADS) $(OPTS) $(SAN)
-LDFLAGS  := $(THREADS) $(SAN) $(PKG_GSL)
+CFLAGS   := $(STD) $(WARN) $(THREADS) $(OPTS) $(SAN) $(PKG_GSL_CFLAGS)
+LDFLAGS  := $(THREADS) $(SAN) $(PKG_GSL_LIBS)
 
 SRC := \
   ./src/cloth.c \

@@ -60,7 +60,7 @@ def _make_distinct_pair(sr: Tuple[int, int], rr: Tuple[int, int]) -> Tuple[int, 
         sender = _pick_party_id(sr)
         receiver = _pick_party_id(rr)
         attempts += 1
-        if sender != receiver or attempts > 25:
+        if sender != receiver or attempts > 2500:
             return sender, receiver
 
 def validate_args(a: argparse.Namespace) -> None:

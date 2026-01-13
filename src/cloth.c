@@ -337,7 +337,11 @@ int main(int argc, char *argv[]) {
   begin = clock();
   simulation->current_time = 1;
   while(heap_len(simulation->events) != 0) {
+    // i want to log something to see the while process and how it is stucking in this loop
+    printf("Events left: %ld, Current time: %ld\n", heap_len(simulation->events), simulation->current_time);
     event = heap_pop(simulation->events, compare_event);
+    // its stucking in events left: 70, now i want to print what are the details before that event and after that
+    printf("Event type: %d, Time: %ld\n", event->payment->id, event->time);
     simulation->current_time = event->time;
     switch(event->type){
     case FINDPATH:
