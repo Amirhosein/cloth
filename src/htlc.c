@@ -114,9 +114,17 @@ void set_node_pair_result_fail(struct element** results, long from_node_id, long
 
   result = get_by_key(results[from_node_id], to_node_id, is_equal_key_result);
 
-  if(result != NULL)
-    if(fail_amount > result->fail_amount && fail_time - result->fail_time < 60000)
+  /* Always update fail info to ensure penalty is applied immediately
+     The old check prevented updating fail info within 60 seconds, which meant
+     rapid retries wouldn't accumulate penalty. Now we always update. */
+  if(result != NULL) {
+    /* Only skip if the new failure is for a smaller amount and very recent */
+    if(fail_amount > result->fail_amount && fail_time - result->fail_time < 100) {
+      /* Still update fail_time to refresh the penalty timer */
+      result->fail_time = fail_time;
       return;
+    }
+  }
 
   if(result == NULL){
     result = malloc(sizeof(struct node_pair_result));
