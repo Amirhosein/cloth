@@ -18,13 +18,13 @@
 #define INF UINT64_MAX
 #define HOPSLIMIT 27
 #define TIMELOCKLIMIT 2016+FINALTIMELOCK
-#define PROBABILITYLIMIT 0.01
+#define PROBABILITYLIMIT 0.2
 #define RISKFACTOR 15
 #define PAYMENTATTEMPTPENALTY 100000
 #define APRIORIWEIGHT 0.5
 #define APRIORIHOPPROBABILITY 0.6
 #define PREVSUCCESSPROBABILITY 0.95
-#define PENALTYHALFLIFE 1
+#define PENALTYHALFLIFE 0.0167  /* ~1 minute (1/60 hours) instead of 1 hour for faster recovery */
 #define MAXMILLISATOSHI UINT64_MAX
 
 
@@ -147,8 +147,80 @@ double calculate_probability(struct element* node_results, long to_node_id, uint
     exit(-1);
   }
   time_since_last_failure = current_time - result->fail_time;
-  weight = get_weight((double)time_since_last_failure);
-  probability = node_probability * (1-weight);
+  
+  /* Strong penalty immediately after failure to force alternative paths */
+  if (time_since_last_failure < 1000) {  /* Less than 1 second since failure */
+    /* Almost zero probability - force dijkstra to find alternative paths */
+    probability = node_probability * 0.001;  /* 0.1% - effectively blocks the edge */
+  } else {
+    printf("JIIIIIIGH\n");
+    /* Decay penalty over time */
+    weight = get_weight((double)time_since_last_failure);
+    probability = node_probability * (0.1 + 0.9 * (1-weight));
+  }
+
+  return probability;
+}
+
+/* Check if edge has sufficient balance - if balance was restored via reverse payments,
+   we should reduce or clear the penalty even if fail_time is recent */
+double calculate_probability_with_balance_check(struct element* node_results, long from_node_id, long to_node_id, uint64_t amount, double node_probability, uint64_t current_time, struct network* network){
+  struct node_pair_result* result;
+  struct node* from_node;
+  struct edge* edge;
+  uint64_t time_since_last_failure;
+  double weight, probability;
+  int i;
+  unsigned int has_sufficient_balance = 0;
+
+  /* First check if any edge from from_node to to_node has sufficient balance */
+  from_node = array_get(network->nodes, from_node_id);
+  for(i = 0; i < array_len(from_node->open_edges); i++) {
+    edge = array_get(network->edges, *(long*)array_get(from_node->open_edges, i));
+    if(edge->to_node_id == to_node_id && edge->balance >= amount) {
+      has_sufficient_balance = 1;
+      break;
+    }
+  }
+
+  result = get_by_key(node_results, to_node_id, is_equal_key_result);
+
+  if(result == NULL)
+    return node_probability;
+
+  if(amount <= result->success_amount)
+    return PREVSUCCESSPROBABILITY;
+
+  if(result->fail_time == 0 || amount < result->fail_amount)
+    return node_probability;
+
+  if(result->fail_time > current_time) {
+    fprintf(stderr, "ERROR (calculate_probability): fail_time > current_time" );
+    exit(-1);
+  }
+
+  time_since_last_failure = current_time - result->fail_time;
+
+  /* If balance was restored (via reverse payments), reduce penalty significantly */
+  if(has_sufficient_balance) {
+    /* Balance is available - reduce penalty to allow using this edge again */
+    if (time_since_last_failure < 1000) {
+      /* Very recent failure but balance restored - moderate penalty */
+      probability = node_probability * 0.3;  /* 30% - allows use but with caution */
+    } else {
+      /* Balance restored and some time passed - minimal penalty */
+      weight = get_weight((double)time_since_last_failure);
+      probability = node_probability * (0.7 + 0.3 * (1-weight));  /* 70-100% of base */
+    }
+  } else {
+    /* No balance available - strong penalty */
+    if (time_since_last_failure < 1000) {
+      probability = node_probability * 0.001;  /* 0.1% - effectively blocks */
+    } else {
+      weight = get_weight((double)time_since_last_failure);
+      probability = node_probability * (0.1 + 0.9 * (1-weight));
+    }
+  }
 
   return probability;
 }
@@ -196,7 +268,10 @@ double get_probability(long from_node_id, long to_node_id, uint64_t amount, long
   else
     node_probability = get_node_probability(results, amount, current_time);
 
-  return calculate_probability(results, to_node_id, MAXMILLISATOSHI, node_probability, current_time);
+  /* Use balance-aware probability calculation to account for reverse payments
+     restoring balance in forward direction */
+  // return calculate_probability_with_balance_check(results, from_node_id, to_node_id, amount, node_probability, current_time, network);
+  return calculate_probability(results, to_node_id, amount, node_probability, current_time);
 }
 
 

@@ -292,6 +292,7 @@ int main(int argc, char *argv[]) {
   clock_t  begin, end;
   double time_spent=0.0;
   long time_spent_thread = 0;
+  long wrong_payments = 0;
   struct network_params net_params;
   struct payments_params pay_params;
   struct timespec start, finish;
@@ -341,7 +342,11 @@ int main(int argc, char *argv[]) {
     printf("Events left: %ld, Current time: %ld\n", heap_len(simulation->events), simulation->current_time);
     event = heap_pop(simulation->events, compare_event);
     // its stucking in events left: 70, now i want to print what are the details before that event and after that
-    printf("Event type: %d, Time: %ld\n", event->payment->id, event->time);
+    printf("Event id: %d, Time: %ld, Event type: %d\n", event->payment->id, event->time, event->type);
+    if (event->payment->sender == event->payment->receiver) {
+      wrong_payments++;
+      continue;
+    }
     simulation->current_time = event->time;
     switch(event->type){
     case FINDPATH:
@@ -383,6 +388,7 @@ int main(int argc, char *argv[]) {
 
   time_spent = (double) (end - begin)/CLOCKS_PER_SEC;
   printf("Time consumed by simulation events: %lf s\n", time_spent);
+  printf("Wrong payments: %ld\n", wrong_payments);
 
   write_output(network, payments, output_dir_name);
 
