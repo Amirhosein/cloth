@@ -10,6 +10,7 @@ import csv
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Set, List, Tuple
+from multiprocessing import Pool, cpu_count
 
 try:
     import numpy as np
@@ -289,35 +290,71 @@ def greedy_node_selection(
     return bought_nodes, control_history, budget_history
 
 
+def _run_single_budget_simulation(args):
+    """
+    Worker function for parallel budget simulation.
+    
+    Args:
+        args: Tuple of (index, budget_millisat, payments_file_str, node_balances, all_nodes)
+    
+    Returns:
+        Tuple of (index, control_count, nodes_bought)
+    """
+    index, budget_millisat, payments_file_str, node_balances, all_nodes = args
+    
+    payments_file = Path(payments_file_str)
+    
+    bought_nodes, control_history, _ = greedy_node_selection(
+        payments_file, node_balances, all_nodes, budget_millisat,
+        original_betweenness=None, budget_threshold=0.95, verbose=False
+    )
+    
+    return (index, control_history[-1], len(bought_nodes))
+
+
 def run_simulation_btc_budgets(
     payments_file: Path,
     node_balances: Dict[int, float],
     all_nodes: Set[int],
     btc_budgets: List[float],
-    original_betweenness: Dict[int, int]
+    original_betweenness: Dict[int, int],
+    num_workers: int = 6
 ) -> Tuple[List[float], List[int]]:
     """
-    Run simulation with BTC-based budgets.
+    Run simulation with BTC-based budgets using parallel processing.
+    
+    Args:
+        num_workers: Number of parallel workers (default: 6)
     
     Returns:
         Tuple of (budgets_btc, controls) - budgets in BTC and corresponding control values
     """
     budgets_millisat = [budget / MILLISAT_TO_BTC for budget in btc_budgets]
-    controls = []
     
-    print(f"\nRunning simulation with BTC budgets...")
+    print(f"\nRunning simulation with BTC budgets (using {num_workers} workers)...")
     print(f"Testing {len(btc_budgets)} budget levels")
     
-    for i, (btc_budget, budget_millisat) in enumerate(zip(btc_budgets, budgets_millisat)):
-        print(f"  [{i+1}/{len(btc_budgets)}] Processing budget: {btc_budget:.6f} BTC...", end=' ', flush=True)
-        
-        bought_nodes, control_history, _ = greedy_node_selection(
-            payments_file, node_balances, all_nodes, budget_millisat,
-            original_betweenness=original_betweenness, budget_threshold=0.95, verbose=False
-        )
-        
-        controls.append(control_history[-1])
-        print(f"Paths controlled: {control_history[-1]:,} (bought {len(bought_nodes)} nodes)")
+    # Prepare arguments for parallel processing
+    # Convert Path to string for pickling, and all_nodes set to list
+    payments_file_str = str(payments_file)
+    all_nodes_list = list(all_nodes)
+    
+    args_list = [
+        (i, budget_millisat, payments_file_str, node_balances, set(all_nodes_list))
+        for i, (btc_budget, budget_millisat) in enumerate(zip(btc_budgets, budgets_millisat))
+    ]
+    
+    # Run in parallel
+    with Pool(processes=num_workers) as pool:
+        results = pool.map(_run_single_budget_simulation, args_list)
+    
+    # Sort results by index (maintain order)
+    results.sort(key=lambda x: x[0])
+    controls = []
+    for index, control, nodes in results:
+        btc_budget = btc_budgets[index]
+        controls.append(control)
+        print(f"  Budget {btc_budget:.6f} BTC: Paths controlled: {control:,} (bought {nodes} nodes)")
     
     return btc_budgets, controls
 
@@ -328,30 +365,44 @@ def run_simulation_percentage_budgets(
     all_nodes: Set[int],
     total_balance: float,
     percentage_budgets: List[float],
-    original_betweenness: Dict[int, int]
+    original_betweenness: Dict[int, int],
+    num_workers: int = 6
 ) -> Tuple[List[float], List[int]]:
     """
-    Run simulation with percentage-based budgets.
+    Run simulation with percentage-based budgets using parallel processing.
+    
+    Args:
+        num_workers: Number of parallel workers (default: 6)
     
     Returns:
         Tuple of (budgets_percent, controls) - budgets as percentages and corresponding control values
     """
     budgets_millisat = [total_balance * p / 100.0 for p in percentage_budgets]
-    controls = []
     
-    print(f"\nRunning simulation with percentage budgets...")
+    print(f"\nRunning simulation with percentage budgets (using {num_workers} workers)...")
     print(f"Testing {len(percentage_budgets)} budget levels")
     
-    for i, (percent_budget, budget_millisat) in enumerate(zip(percentage_budgets, budgets_millisat)):
-        print(f"  [{i+1}/{len(percentage_budgets)}] Processing budget: {percent_budget:.2f}%...", end=' ', flush=True)
-        
-        bought_nodes, control_history, _ = greedy_node_selection(
-            payments_file, node_balances, all_nodes, budget_millisat,
-            original_betweenness=original_betweenness, budget_threshold=0.95, verbose=False
-        )
-        
-        controls.append(control_history[-1])
-        print(f"Paths controlled: {control_history[-1]:,} (bought {len(bought_nodes)} nodes)")
+    # Prepare arguments for parallel processing
+    # Convert Path to string for pickling, and all_nodes set to list
+    payments_file_str = str(payments_file)
+    all_nodes_list = list(all_nodes)
+    
+    args_list = [
+        (i, budget_millisat, payments_file_str, node_balances, set(all_nodes_list))
+        for i, (percent_budget, budget_millisat) in enumerate(zip(percentage_budgets, budgets_millisat))
+    ]
+    
+    # Run in parallel
+    with Pool(processes=num_workers) as pool:
+        results = pool.map(_run_single_budget_simulation, args_list)
+    
+    # Sort results by index (maintain order)
+    results.sort(key=lambda x: x[0])
+    controls = []
+    for index, control, nodes in results:
+        percent_budget = percentage_budgets[index]
+        controls.append(control)
+        print(f"  Budget {percent_budget:.2f}%: Paths controlled: {control:,} (bought {nodes} nodes)")
     
     return percentage_budgets, controls
 
@@ -474,13 +525,19 @@ def main():
     print(f"\nBTC Budgets (10 values from 0.01 to 20 BTC): {btc_budgets}")
     print(f"Percentage Budgets (10 values from 0.01% to 10%): {percent_budgets}")
     
+    # Determine number of workers (use 6 or available CPU count, whichever is smaller)
+    num_workers = min(6, cpu_count(), len(btc_budgets))
+    print(f"\nUsing {num_workers} parallel workers for simulation")
+    
     # Run simulations
     btc_budgets_result, btc_controls = run_simulation_btc_budgets(
-        payments_file, node_balances, all_nodes, btc_budgets, original_betweenness
+        payments_file, node_balances, all_nodes, btc_budgets, original_betweenness,
+        num_workers=num_workers
     )
     
     percent_budgets_result, percent_controls = run_simulation_percentage_budgets(
-        payments_file, node_balances, all_nodes, total_balance, percent_budgets, original_betweenness
+        payments_file, node_balances, all_nodes, total_balance, percent_budgets, original_betweenness,
+        num_workers=num_workers
     )
     
     # Generate plots
@@ -518,4 +575,7 @@ def main():
 
 
 if __name__ == '__main__':
+    # Required for multiprocessing on Windows/macOS
+    import multiprocessing
+    multiprocessing.freeze_support()
     main()
