@@ -269,17 +269,17 @@ def greedy_node_selection(
         exclude_nodes.add(best_node)
         remaining_budget -= node_cost
         
-        # Calculate current total control (unique payment paths controlled)
-        # This represents how many unique successful payments pass through at least one bought node
-        total_control = count_unique_paths_controlled(payments_file, set(bought_nodes))
-        
-        control_history.append(total_control)
         budget_history.append(remaining_budget)
         
         if verbose and iteration % 10 == 0:
             print(f"Iteration {iteration}: Bought node {best_node}, "
-                  f"Paths controlled: {total_control:,}, Budget remaining: {remaining_budget:,.0f} millisat "
+                  f"Budget remaining: {remaining_budget:,.0f} millisat "
                   f"({budget_spent_ratio*100:.1f}% spent)")
+    
+    # Calculate control once at the end after all nodes are bought
+    # This represents how many unique successful payments pass through at least one bought node
+    total_control = count_unique_paths_controlled(payments_file, set(bought_nodes))
+    control_history.append(total_control)
     
     if verbose:
         print(f"\nCompleted: Bought {len(bought_nodes)} nodes")
