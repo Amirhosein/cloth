@@ -28,6 +28,19 @@ except ImportError:
 # Constants
 MILLISAT_TO_BTC = 1e-11  # 1 millisat = 1e-11 BTC
 
+# =========================
+# Budget configuration
+# =========================
+# BTC budget grid (log scale)
+BTC_BUDGET_MIN = 0.01
+BTC_BUDGET_MAX = 20.0
+BTC_BUDGET_POINTS = 50
+
+# Percent-of-network budget grid (linear scale)
+PCT_BUDGET_MIN = 0.01
+PCT_BUDGET_MAX = 4.0
+PCT_BUDGET_POINTS = 50
+
 
 def parse_payment_routes(payments_file: Path, exclude_nodes: Set[int] = None) -> Dict[int, int]:
     """
@@ -117,6 +130,9 @@ def load_successful_payments(
 
     Each element is a tuple: (sender_id, receiver_id, [intermediate_node_ids]).
     Failed or invalid routes (-1 or empty) are skipped.
+
+    NOTE: This function expects `route` to contain intermediate *node ids* (NOT edge ids).
+    Use `convert_edges.py` to generate the node-route CSV from the edge-route CSV.
     """
     payment_paths: List[Tuple[int, int, List[int]]] = []
 
@@ -145,12 +161,17 @@ def build_payments_of_node(
 ) -> Dict[int, List[int]]:
     """
     Build incidence: for each node, list of payment indices where it appears.
+
+    IMPORTANT: We only include **intermediate nodes** (the `route` field) and
+    intentionally exclude the sender/receiver endpoints. This prevents the
+    adversary from getting “credit” for buying leaf endpoint nodes.
     """
     payments_of_node: Dict[int, List[int]] = defaultdict(list)
 
     for pid, (sender_id, receiver_id, intermediates) in enumerate(payment_paths):
-        nodes_in_path = {sender_id, receiver_id, *intermediates}
-        for node_id in nodes_in_path:
+        # Only use the intermediate nodes from the route field.
+        # (Sender/receiver are excluded by design.)
+        for node_id in set(intermediates):
             payments_of_node[node_id].append(pid)
 
     return payments_of_node
@@ -462,7 +483,7 @@ def plot_results(
 def main():
     # File paths
     base_dir = Path(__file__).parent
-    payments_file = base_dir / 'results' / 'outpayments_output1Mil.csv'
+    payments_file = base_dir / 'results' / 'outpayments_output1Mil_nodes.csv'
     channels_file = base_dir / 'data' / 'channels_ln.csv'
     nodes_file = base_dir / 'data' / 'nodes_ln.csv'
     results_dir = base_dir / 'results'
@@ -511,32 +532,68 @@ def main():
     print(f"Total node appearances in payment paths: {total_node_appearances:,}")
     print(f"(This is the sum of all node occurrences, not the number of transactions)")
     
-    # Define budget ranges
-    # BTC budgets: from 0.01 to 20 BTC (exactly 10 budgets, logarithmic scale)
-    # Always use 0.01 to 20 BTC range regardless of network balance
-    max_btc_budget = 20.0
+    # Define budget ranges (configured at top of file)
+    if BTC_BUDGET_POINTS <= 0 or PCT_BUDGET_POINTS <= 0:
+        raise ValueError("Budget points must be positive.")
+    if BTC_BUDGET_MIN <= 0 or BTC_BUDGET_MAX <= 0 or BTC_BUDGET_MIN > BTC_BUDGET_MAX:
+        raise ValueError("BTC_BUDGET_MIN/BTC_BUDGET_MAX must be positive and min <= max.")
+    if PCT_BUDGET_MIN < 0 or PCT_BUDGET_MAX < 0 or PCT_BUDGET_MIN > PCT_BUDGET_MAX:
+        raise ValueError("PCT_BUDGET_MIN/PCT_BUDGET_MAX must satisfy 0 <= min <= max.")
+
     if HAS_NUMPY:
-        # Use logarithmic scale from 0.01 to 20 BTC (exactly 10 values)
-        btc_budgets = np.logspace(np.log10(0.01), np.log10(max_btc_budget), 10).tolist()
+        # Use logarithmic scale for BTC budgets
+        if BTC_BUDGET_POINTS == 1:
+            btc_budgets = [float(BTC_BUDGET_MIN)]
+        else:
+            btc_budgets = np.logspace(
+                np.log10(BTC_BUDGET_MIN),
+                np.log10(BTC_BUDGET_MAX),
+                BTC_BUDGET_POINTS,
+            ).tolist()
         btc_budgets = [round(b, 6) for b in btc_budgets]
         
-        # Percentage budgets: from 0.01% to 50% of network balance (exactly 10 budgets)
-        percent_budgets = np.linspace(0.01, 10.0, 10).tolist()
+        # Use linear scale for percent budgets
+        percent_budgets = np.linspace(PCT_BUDGET_MIN, PCT_BUDGET_MAX, PCT_BUDGET_POINTS).tolist()
         percent_budgets = [round(p, 2) for p in percent_budgets]
     else:
         # Fallback if numpy not available - use manual ranges
         print("Warning: numpy not available, using manual budget ranges")
-        # Logarithmic scale: 0.01 * (20/0.01)^(i/9) for i in 0..9
-        btc_budgets = [0.01 * ((max_btc_budget / 0.01) ** (i / 9.0)) for i in range(10)]
+        # Logarithmic BTC grid
+        if BTC_BUDGET_POINTS == 1:
+            btc_budgets = [float(BTC_BUDGET_MIN)]
+        else:
+            btc_budgets = [
+                BTC_BUDGET_MIN
+                * ((BTC_BUDGET_MAX / BTC_BUDGET_MIN) ** (i / (BTC_BUDGET_POINTS - 1)))
+                for i in range(BTC_BUDGET_POINTS)
+            ]
         btc_budgets = [round(b, 6) for b in btc_budgets]
-        # Percentage budgets: evenly spaced from 0.01% to 10%
-        percent_budgets = [0.01 + (10.0 - 0.01) * i / 9.0 for i in range(10)]
+
+        # Linear percent grid
+        if PCT_BUDGET_POINTS == 1:
+            percent_budgets = [float(PCT_BUDGET_MIN)]
+        else:
+            percent_budgets = [
+                PCT_BUDGET_MIN
+                + (PCT_BUDGET_MAX - PCT_BUDGET_MIN) * i / (PCT_BUDGET_POINTS - 1)
+                for i in range(PCT_BUDGET_POINTS)
+            ]
         percent_budgets = [round(p, 2) for p in percent_budgets]
     
-    print(f"\nBTC Budgets (10 values from 0.01 to 20 BTC): {btc_budgets}")
-    print(f"Percentage Budgets (10 values from 0.01% to 10%): {percent_budgets}")
-    print(f"\nTotal BTC budget span: {min(btc_budgets):.6f} BTC -> {max(btc_budgets):.6f} BTC")
-    print(f"Total percentage budget span: {min(percent_budgets):.2f}% -> {max(percent_budgets):.2f}%")
+    print(
+        f"\nBTC Budgets ({len(btc_budgets)} points, logspace): "
+        f"{BTC_BUDGET_MIN} BTC -> {BTC_BUDGET_MAX} BTC"
+    )
+    print(
+        f"Percent Budgets ({len(percent_budgets)} points, linspace): "
+        f"{PCT_BUDGET_MIN}% -> {PCT_BUDGET_MAX}%"
+    )
+    print(
+        f"Total BTC budget span: {min(btc_budgets):.6f} BTC -> {max(btc_budgets):.6f} BTC"
+    )
+    print(
+        f"Total percent budget span: {min(percent_budgets):.2f}% -> {max(percent_budgets):.2f}%"
+    )
 
     # Build coverage structures for CELF-based selection
     print("\nLoading successful payments into memory for coverage-based selection...")
