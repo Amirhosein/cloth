@@ -7,10 +7,10 @@ to maximize control (betweenness) over the payment network.
 """
 
 import csv
+import heapq
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Set, List, Tuple
-from multiprocessing import Pool, cpu_count
 
 try:
     import numpy as np
@@ -109,45 +109,51 @@ def get_total_network_balance(node_balances: Dict[int, float]) -> float:
     return sum(node_balances.values())
 
 
-def count_unique_paths_controlled(
+def load_successful_payments(
     payments_file: Path,
-    bought_nodes: Set[int]
-) -> int:
+) -> List[Tuple[int, int, List[int]]]:
     """
-    Count unique successful payment paths that contain at least one bought node.
-    
-    Args:
-        payments_file: Path to payments CSV file
-        bought_nodes: Set of node IDs that have been bought by adversary
-        
-    Returns:
-        int: Number of unique successful payments that pass through at least one bought node
+    Load all successful payment paths into memory.
+
+    Each element is a tuple: (sender_id, receiver_id, [intermediate_node_ids]).
+    Failed or invalid routes (-1 or empty) are skipped.
     """
-    controlled_payments = 0
-    
-    with open(payments_file, 'r') as f:
+    payment_paths: List[Tuple[int, int, List[int]]] = []
+
+    with open(payments_file, "r") as f:
         reader = csv.DictReader(f)
-        
         for row in reader:
-            is_success = int(row['is_success'])
-            route = row['route'].strip()
-            sender_id = int(row['sender_id'])
-            receiver_id = int(row['receiver_id'])
-            
-            # Only process successful payments with valid routes
-            if is_success == 1 and route != '-1' and route:
-                # Check if sender or receiver is bought
-                if sender_id in bought_nodes or receiver_id in bought_nodes:
-                    controlled_payments += 1
-                    continue
-                
-                # Check intermediate nodes
-                if route:
-                    route_nodes = [int(node_id) for node_id in route.split('-') if node_id.strip()]
-                    if any(node_id in bought_nodes for node_id in route_nodes):
-                        controlled_payments += 1
-    
-    return controlled_payments
+            is_success = int(row["is_success"])
+            route = row["route"].strip()
+            if not (is_success == 1 and route and route != "-1"):
+                continue
+
+            sender_id = int(row["sender_id"])
+            receiver_id = int(row["receiver_id"])
+
+            intermediates: List[int] = [
+                int(node_id) for node_id in route.split("-") if node_id.strip()
+            ]
+
+            payment_paths.append((sender_id, receiver_id, intermediates))
+
+    return payment_paths
+
+
+def build_payments_of_node(
+    payment_paths: List[Tuple[int, int, List[int]]],
+) -> Dict[int, List[int]]:
+    """
+    Build incidence: for each node, list of payment indices where it appears.
+    """
+    payments_of_node: Dict[int, List[int]] = defaultdict(list)
+
+    for pid, (sender_id, receiver_id, intermediates) in enumerate(payment_paths):
+        nodes_in_path = {sender_id, receiver_id, *intermediates}
+        for node_id in nodes_in_path:
+            payments_of_node[node_id].append(pid)
+
+    return payments_of_node
 
 
 def compute_betweenness_with_exclusions(
@@ -183,133 +189,118 @@ def compute_betweenness_with_exclusions(
     return results
 
 
-def greedy_node_selection(
-    payments_file: Path,
-    node_balances: Dict[int, float],
-    all_nodes: Set[int],
+def celf_greedy_selection(
+    payment_paths: List[Tuple[int, int, List[int]]],
+    payments_of_node: Dict[int, List[int]],
+    node_costs: Dict[int, float],
     budget_millisat: float,
-    original_betweenness: Dict[int, int] = None,
     budget_threshold: float = 0.95,
-    verbose: bool = False
-) -> Tuple[List[int], List[int], List[float]]:
+    verbose: bool = False,
+) -> Tuple[List[int], int, float]:
     """
-    Greedy algorithm to select nodes maximizing control within budget.
-    Selects nodes based on betweenness/cost ratio to maximize efficiency.
-    
-    Args:
-        payments_file: Path to payments CSV
-        node_balances: Dict of node balances
-        all_nodes: Set of all node IDs
-        budget_millisat: Budget in millisatoshis
-        original_betweenness: Original betweenness counts (not used, kept for compatibility)
-        budget_threshold: Stop when remaining budget is less than this fraction (default 0.95 = 95% spent)
-        verbose: Print progress if True
-        
-    Returns:
-        Tuple of (bought_nodes, control_history, budget_history)
-        - bought_nodes: List of node IDs purchased
-        - control_history: List of unique payment paths controlled after each purchase
-        - budget_history: List of remaining budget after each purchase
+    CELF-style greedy selection to maximize covered payments under a budget.
+
+    - Universe: payment indices [0..n_payments-1]
+    - Each node v is associated with payments_of_node[v] ⊆ {0..n_payments-1}
+    - Cost of node v is node_costs[v] (millisat)
+    - Objective: maximize # of covered payments under total cost ≤ budget_millisat
     """
-    
-    bought_nodes = []
-    exclude_nodes = set()
-    remaining_budget = budget_millisat
-    initial_budget = budget_millisat
-    control_history = [0]
-    budget_history = [budget_millisat]
-    
-    iteration = 0
-    
-    while True:
-        iteration += 1
-        
-        # Check threshold: stop if we've spent >= threshold% of budget
-        budget_spent_ratio = (initial_budget - remaining_budget) / initial_budget
+    n_payments = len(payment_paths)
+    covered = [False] * n_payments
+
+    bought_nodes: List[int] = []
+    remaining_budget = float(budget_millisat)
+    initial_budget = float(budget_millisat)
+
+    # Max-heap implemented as min-heap with negative ratio
+    heap: List[Tuple[float, int, int]] = []  # (-ratio, node_id, last_gain)
+
+    # Initial marginal gains: all payments uncovered
+    for node_id, pids in payments_of_node.items():
+        cost = float(node_costs.get(node_id, 0.0))
+        if cost <= 0 or cost > remaining_budget:
+            continue
+        gain = len(pids)
+        if gain <= 0:
+            continue
+        ratio = gain / cost
+        heapq.heappush(heap, (-ratio, node_id, gain))
+
+    if verbose:
+        print(
+            f"[CELF] Initialized {len(heap)} candidate nodes "
+            f"for budget {budget_millisat:,.0f} millisat"
+        )
+
+    iterations = 0
+
+    while heap and remaining_budget > 0:
+        iterations += 1
+        budget_spent_ratio = (
+            (initial_budget - remaining_budget) / initial_budget if initial_budget > 0 else 0.0
+        )
         if budget_spent_ratio >= budget_threshold:
             if verbose:
-                print(f"Threshold reached: {budget_spent_ratio*100:.1f}% of budget spent. Stopping.")
+                print(
+                    f"[CELF] Threshold reached: {budget_spent_ratio*100:.1f}% of budget spent. Stopping."
+                )
             break
-        
-        # Compute current betweenness excluding bought nodes
-        current_analysis = compute_betweenness_with_exclusions(
-            payments_file, node_balances, all_nodes, exclude_nodes
-        )
-        
-        # Find best affordable node based on betweenness/cost ratio
-        best_node = None
-        best_ratio = -1.0  # Initialize to -1 to handle zero ratios
-        
-        for node_data in current_analysis:
-            node_id = node_data['node_id']
-            betweenness = node_data['betweenness_count']
-            balance = node_data['balance(millisat)']
-            
-            # Can we afford this node?
-            if balance <= remaining_budget:
-                # Calculate betweenness/cost ratio
-                # Handle zero-cost nodes as infinite ratio (highest priority)
-                if balance == 0:
-                    ratio = float('inf')
-                else:
-                    ratio = betweenness / balance
-                
-                # Select node with highest ratio
-                if ratio > best_ratio:
-                    best_node = node_id
-                    best_ratio = ratio
-        
-        # No affordable node found
-        if best_node is None:
-            break
-        
-        # Buy the node
-        node_cost = node_balances[best_node]
-        bought_nodes.append(best_node)
-        exclude_nodes.add(best_node)
-        remaining_budget -= node_cost
-        
-        budget_history.append(remaining_budget)
-        
-        if verbose and iteration % 10 == 0:
-            print(f"Iteration {iteration}: Bought node {best_node}, "
-                  f"Budget remaining: {remaining_budget:,.0f} millisat "
-                  f"({budget_spent_ratio*100:.1f}% spent)")
-    
-    # Calculate control once at the end after all nodes are bought
-    # This represents how many unique successful payments pass through at least one bought node
-    total_control = count_unique_paths_controlled(payments_file, set(bought_nodes))
-    control_history.append(total_control)
-    
+
+        neg_ratio, node_id, old_gain = heapq.heappop(heap)
+        cost = float(node_costs.get(node_id, 0.0))
+        if cost <= 0 or cost > remaining_budget:
+            continue
+
+        # Recompute marginal gain with current covered[]
+        new_gain = 0
+        for pid in payments_of_node.get(node_id, []):
+            if not covered[pid]:
+                new_gain += 1
+
+        if new_gain <= 0:
+            # No additional coverage
+            continue
+
+        new_ratio = new_gain / cost if cost > 0 else float("inf")
+
+        # Lazy evaluation: check if still best
+        if heap:
+            next_neg_ratio, _, _ = heap[0]
+            if -next_neg_ratio > new_ratio:
+                # Someone else looks better; reinsert with updated ratio
+                heapq.heappush(heap, (-new_ratio, node_id, new_gain))
+                continue
+
+        # Accept this node
+        newly_covered = 0
+        for pid in payments_of_node.get(node_id, []):
+            if not covered[pid]:
+                covered[pid] = True
+                newly_covered += 1
+
+        bought_nodes.append(node_id)
+        remaining_budget -= cost
+
+        if verbose:
+            print(
+                f"[CELF] Iteration {iterations}: bought node {node_id} "
+                f"(gain={newly_covered}, cost={cost:,.0f}, ratio={new_ratio:.6f}), "
+                f"remaining budget={remaining_budget:,.0f}"
+            )
+
+    total_covered = sum(1 for c in covered if c)
+
     if verbose:
-        print(f"\nCompleted: Bought {len(bought_nodes)} nodes")
-        print(f"Unique payment paths controlled: {control_history[-1]:,}")
-        print(f"Budget remaining: {remaining_budget:,.0f} millisat")
-        print(f"Budget spent: {(initial_budget - remaining_budget) / initial_budget * 100:.1f}%")
-    
-    return bought_nodes, control_history, budget_history
+        spent_ratio = (
+            (initial_budget - remaining_budget) / initial_budget if initial_budget > 0 else 0.0
+        )
+        print(
+            f"[CELF] Completed selection: bought {len(bought_nodes)} nodes, "
+            f"covered {total_covered:,} / {n_payments:,} payments, "
+            f"budget spent ≈ {spent_ratio*100:.2f}%"
+        )
 
-
-def _run_single_budget_simulation(args):
-    """
-    Worker function for parallel budget simulation.
-    
-    Args:
-        args: Tuple of (index, budget_millisat, payments_file_str, node_balances, all_nodes)
-    
-    Returns:
-        Tuple of (index, control_count, nodes_bought)
-    """
-    index, budget_millisat, payments_file_str, node_balances, all_nodes = args
-    
-    payments_file = Path(payments_file_str)
-    
-    bought_nodes, control_history, _ = greedy_node_selection(
-        payments_file, node_balances, all_nodes, budget_millisat,
-        original_betweenness=None, budget_threshold=0.95, verbose=False
-    )
-    
-    return (index, control_history[-1], len(bought_nodes))
+    return bought_nodes, total_covered, remaining_budget
 
 
 def run_simulation_btc_budgets(
@@ -318,43 +309,45 @@ def run_simulation_btc_budgets(
     all_nodes: Set[int],
     btc_budgets: List[float],
     original_betweenness: Dict[int, int],
-    num_workers: int = 6
+    payment_paths: List[Tuple[int, int, List[int]]],
+    payments_of_node: Dict[int, List[int]],
+    node_costs: Dict[int, float],
 ) -> Tuple[List[float], List[int]]:
     """
-    Run simulation with BTC-based budgets using parallel processing.
-    
-    Args:
-        num_workers: Number of parallel workers (default: 6)
+    Run simulation with BTC-based budgets sequentially.
     
     Returns:
         Tuple of (budgets_btc, controls) - budgets in BTC and corresponding control values
     """
     budgets_millisat = [budget / MILLISAT_TO_BTC for budget in btc_budgets]
     
-    print(f"\nRunning simulation with BTC budgets (using {num_workers} workers)...")
+    print(f"\nRunning simulation with BTC budgets (sequential)...")
     print(f"Testing {len(btc_budgets)} budget levels")
     
-    # Prepare arguments for parallel processing
-    # Convert Path to string for pickling, and all_nodes set to list
-    payments_file_str = str(payments_file)
-    all_nodes_list = list(all_nodes)
+    controls: List[int] = []
     
-    args_list = [
-        (i, budget_millisat, payments_file_str, node_balances, set(all_nodes_list))
-        for i, (btc_budget, budget_millisat) in enumerate(zip(btc_budgets, budgets_millisat))
-    ]
-    
-    # Run in parallel
-    with Pool(processes=num_workers) as pool:
-        results = pool.map(_run_single_budget_simulation, args_list)
-    
-    # Sort results by index (maintain order)
-    results.sort(key=lambda x: x[0])
-    controls = []
-    for index, control, nodes in results:
-        btc_budget = btc_budgets[index]
-        controls.append(control)
-        print(f"  Budget {btc_budget:.6f} BTC: Paths controlled: {control:,} (bought {nodes} nodes)")
+    for i, (btc_budget, budget_millisat) in enumerate(zip(btc_budgets, budgets_millisat), start=1):
+        print(f"\n[BTC {i}/{len(btc_budgets)}] Starting budget {btc_budget:.6f} BTC "
+              f"(≈ {budget_millisat:,.0f} millisat)")
+        
+        bought_nodes, total_covered, remaining_budget = celf_greedy_selection(
+            payment_paths,
+            payments_of_node,
+            node_costs,
+            budget_millisat,
+            budget_threshold=0.95,
+            verbose=False,
+        )
+        
+        controls.append(total_covered)
+        
+        spent_ratio = 0.0
+        if budget_millisat > 0:
+            spent_ratio = (budget_millisat - remaining_budget) / budget_millisat
+        
+        print(f"[BTC {i}/{len(btc_budgets)}] Finished budget {btc_budget:.6f} BTC: "
+              f"paths controlled = {total_covered:,}, nodes bought = {len(bought_nodes)}, "
+              f"budget used ≈ {spent_ratio*100:.2f}%")
     
     return btc_budgets, controls
 
@@ -366,43 +359,47 @@ def run_simulation_percentage_budgets(
     total_balance: float,
     percentage_budgets: List[float],
     original_betweenness: Dict[int, int],
-    num_workers: int = 6
+    payment_paths: List[Tuple[int, int, List[int]]],
+    payments_of_node: Dict[int, List[int]],
+    node_costs: Dict[int, float],
 ) -> Tuple[List[float], List[int]]:
     """
-    Run simulation with percentage-based budgets using parallel processing.
-    
-    Args:
-        num_workers: Number of parallel workers (default: 6)
+    Run simulation with percentage-based budgets sequentially.
     
     Returns:
         Tuple of (budgets_percent, controls) - budgets as percentages and corresponding control values
     """
     budgets_millisat = [total_balance * p / 100.0 for p in percentage_budgets]
     
-    print(f"\nRunning simulation with percentage budgets (using {num_workers} workers)...")
+    print(f"\nRunning simulation with percentage budgets (sequential)...")
     print(f"Testing {len(percentage_budgets)} budget levels")
     
-    # Prepare arguments for parallel processing
-    # Convert Path to string for pickling, and all_nodes set to list
-    payments_file_str = str(payments_file)
-    all_nodes_list = list(all_nodes)
+    controls: List[int] = []
     
-    args_list = [
-        (i, budget_millisat, payments_file_str, node_balances, set(all_nodes_list))
-        for i, (percent_budget, budget_millisat) in enumerate(zip(percentage_budgets, budgets_millisat))
-    ]
-    
-    # Run in parallel
-    with Pool(processes=num_workers) as pool:
-        results = pool.map(_run_single_budget_simulation, args_list)
-    
-    # Sort results by index (maintain order)
-    results.sort(key=lambda x: x[0])
-    controls = []
-    for index, control, nodes in results:
-        percent_budget = percentage_budgets[index]
-        controls.append(control)
-        print(f"  Budget {percent_budget:.2f}%: Paths controlled: {control:,} (bought {nodes} nodes)")
+    for i, (percent_budget, budget_millisat) in enumerate(
+        zip(percentage_budgets, budgets_millisat), start=1
+    ):
+        print(f"\n[PCT {i}/{len(percentage_budgets)}] Starting budget {percent_budget:.2f}% "
+              f"(≈ {budget_millisat:,.0f} millisat)")
+        
+        bought_nodes, total_covered, remaining_budget = celf_greedy_selection(
+            payment_paths,
+            payments_of_node,
+            node_costs,
+            budget_millisat,
+            budget_threshold=0.95,
+            verbose=False,
+        )
+        
+        controls.append(total_covered)
+        
+        spent_ratio = 0.0
+        if budget_millisat > 0:
+            spent_ratio = (budget_millisat - remaining_budget) / budget_millisat
+        
+        print(f"[PCT {i}/{len(percentage_budgets)}] Finished budget {percent_budget:.2f}%: "
+              f"paths controlled = {total_covered:,}, nodes bought = {len(bought_nodes)}, "
+              f"budget used ≈ {spent_ratio*100:.2f}%")
     
     return percentage_budgets, controls
 
@@ -412,39 +409,53 @@ def plot_results(
     btc_controls: List[int],
     percent_budgets: List[float],
     percent_controls: List[int],
-    output_dir: Path
+    total_payments: int,
+    output_dir: Path,
 ):
-    """Generate and save visualization charts."""
-    
+    """Generate and save visualization charts.
+
+    Plots y-axis as percentage of successful payments covered.
+    """
+
     if not HAS_MATPLOTLIB:
         print("Warning: matplotlib not available, skipping chart generation")
         return
-    
+
+    if total_payments <= 0:
+        print("Warning: total_payments is non-positive; skipping chart generation")
+        return
+
+    # Convert absolute counts to percentages of covered payments
+    btc_controls_pct = [100.0 * c / total_payments for c in btc_controls]
+    percent_controls_pct = [100.0 * c / total_payments for c in percent_controls]
+
     # Create figure with two subplots
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
-    
+
     # Plot 1: BTC-based budgets
-    ax1.plot(btc_budgets, btc_controls, 'b-', linewidth=2, marker='o', markersize=4)
-    ax1.set_xlabel('Budget (BTC)', fontsize=12)
-    ax1.set_ylabel('Unique Payment Paths Controlled', fontsize=12)
-    ax1.set_title('Adversary Control vs Budget (BTC)', fontsize=14, fontweight='bold')
+    ax1.plot(btc_budgets, btc_controls_pct, "b-", linewidth=2, marker="o", markersize=4)
+    ax1.set_xlabel("Budget (BTC)", fontsize=12)
+    ax1.set_ylabel("Successful Payments Covered (%)", fontsize=12)
+    ax1.set_title("Adversary Control vs Budget (BTC)", fontsize=14, fontweight="bold")
     ax1.grid(True, alpha=0.3)
-    ax1.ticklabel_format(style='scientific', axis='x', scilimits=(0,0))
-    
+    ax1.ticklabel_format(style="plain", axis="x", scilimits=(0, 0))
+
     # Plot 2: Percentage-based budgets
-    ax2.plot(percent_budgets, percent_controls, 'r-', linewidth=2, marker='s', markersize=4)
-    ax2.set_xlabel('Budget (% of Network Balance)', fontsize=12)
-    ax2.set_ylabel('Unique Payment Paths Controlled', fontsize=12)
-    ax2.set_title('Adversary Control vs Budget (% of Network)', fontsize=14, fontweight='bold')
+    ax2.plot(
+        percent_budgets, percent_controls_pct, "r-", linewidth=2, marker="s", markersize=4
+    )
+    ax2.set_xlabel("Budget (% of Network Balance)", fontsize=12)
+    ax2.set_ylabel("Successful Payments Covered (%)", fontsize=12)
+    ax2.set_title("Adversary Control vs Budget (% of Network)", fontsize=14, fontweight="bold")
     ax2.grid(True, alpha=0.3)
-    
+
     plt.tight_layout()
-    
+
     # Save figure
-    output_file = output_dir / 'adversary_control_analysis.png'
-    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    output_file = output_dir / "adversary_control_analysis.png"
+    plt.savefig(output_file, dpi=300, bbox_inches="tight")
     print(f"\nSaved chart to {output_file}")
-    
+
     plt.close()
 
 
@@ -524,28 +535,57 @@ def main():
     
     print(f"\nBTC Budgets (10 values from 0.01 to 20 BTC): {btc_budgets}")
     print(f"Percentage Budgets (10 values from 0.01% to 10%): {percent_budgets}")
+    print(f"\nTotal BTC budget span: {min(btc_budgets):.6f} BTC -> {max(btc_budgets):.6f} BTC")
+    print(f"Total percentage budget span: {min(percent_budgets):.2f}% -> {max(percent_budgets):.2f}%")
+
+    # Build coverage structures for CELF-based selection
+    print("\nLoading successful payments into memory for coverage-based selection...")
+    payment_paths = load_successful_payments(payments_file)
+    print(f"Loaded {len(payment_paths):,} successful payment paths")
+
+    print("Building node–payment incidence (payments_of_node)...")
+    payments_of_node = build_payments_of_node(payment_paths)
+    print(f"Found {len(payments_of_node):,} nodes with at least one incident payment")
+
+    # Node costs in millisatoshi (based on initial balances)
+    node_costs: Dict[int, float] = {
+        node_id: float(balance) for node_id, balance in node_balances.items() if balance > 0
+    }
+    print(f"Nodes with positive cost (balance): {len(node_costs):,}")
     
-    # Determine number of workers (use 6 or available CPU count, whichever is smaller)
-    num_workers = min(6, cpu_count(), len(btc_budgets))
-    print(f"\nUsing {num_workers} parallel workers for simulation")
-    
-    # Run simulations
+    # Run simulations sequentially using CELF-based coverage optimization
     btc_budgets_result, btc_controls = run_simulation_btc_budgets(
-        payments_file, node_balances, all_nodes, btc_budgets, original_betweenness,
-        num_workers=num_workers
+        payments_file,
+        node_balances,
+        all_nodes,
+        btc_budgets,
+        original_betweenness,
+        payment_paths,
+        payments_of_node,
+        node_costs,
     )
     
     percent_budgets_result, percent_controls = run_simulation_percentage_budgets(
-        payments_file, node_balances, all_nodes, total_balance, percent_budgets, original_betweenness,
-        num_workers=num_workers
+        payments_file,
+        node_balances,
+        all_nodes,
+        total_balance,
+        percent_budgets,
+        original_betweenness,
+        payment_paths,
+        payments_of_node,
+        node_costs,
     )
     
-    # Generate plots
-    print("\nGenerating visualization charts...")
+    # Generate plots (as percentage of successful payments covered)
+    print("\nGenerating visualization charts (percentage of successful payments covered)...")
     plot_results(
-        btc_budgets_result, btc_controls,
-        percent_budgets_result, percent_controls,
-        results_dir
+        btc_budgets_result,
+        btc_controls,
+        percent_budgets_result,
+        percent_controls,
+        len(payment_paths),
+        results_dir,
     )
     
     # Save results to CSV
@@ -575,7 +615,4 @@ def main():
 
 
 if __name__ == '__main__':
-    # Required for multiprocessing on Windows/macOS
-    import multiprocessing
-    multiprocessing.freeze_support()
     main()
