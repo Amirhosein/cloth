@@ -483,7 +483,7 @@ def plot_results(
 def main():
     # File paths
     base_dir = Path(__file__).parent
-    payments_file = base_dir / 'results' / 'outpayments_output1Mil_nodes.csv'
+    payments_file = base_dir / 'results' / 'outpayments_output_nodes.csv'
     channels_file = base_dir / 'data' / 'channels_ln.csv'
     nodes_file = base_dir / 'data' / 'nodes_ln.csv'
     results_dir = base_dir / 'results'
