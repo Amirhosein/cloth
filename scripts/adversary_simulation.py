@@ -4,8 +4,12 @@ Adversary Simulation: Greedy node purchase to maximize network control.
 
 This script simulates an adversary with a budget trying to buy nodes
 to maximize control (betweenness) over the payment network.
+
+Usage:
+  python adversary_simulation.py --payments <payments.csv> --channels <channels_ln.csv> --nodes <nodes_ln.csv> [--output-dir <dir>]
 """
 
+import argparse
 import csv
 import heapq
 from collections import defaultdict
@@ -480,19 +484,51 @@ def plot_results(
     plt.close()
 
 
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Adversary simulation: greedy node purchase to maximize control over payment paths.",
+    )
+    p.add_argument(
+        "--payments",
+        type=str,
+        required=True,
+        help="Path to payments CSV (with columns: sender_id, receiver_id, route, is_success).",
+    )
+    p.add_argument(
+        "--channels",
+        type=str,
+        required=True,
+        help="Path to channels_ln.csv (node1_id, node2_id, capacity(millisat)).",
+    )
+    p.add_argument(
+        "--nodes",
+        type=str,
+        required=True,
+        help="Path to nodes_ln.csv (id column).",
+    )
+    p.add_argument(
+        "--output-dir",
+        type=str,
+        default="results",
+        help="Directory for output CSVs and plot (default: results).",
+    )
+    return p.parse_args()
+
+
 def main():
-    # File paths
-    base_dir = Path(__file__).parent
-    payments_file = base_dir / 'results' / 'outpayments_output_nodes.csv'
-    channels_file = base_dir / 'data' / 'channels_ln.csv'
-    nodes_file = base_dir / 'data' / 'nodes_ln.csv'
-    results_dir = base_dir / 'results'
-    
+    args = parse_args()
+    payments_file = Path(args.payments)
+    channels_file = Path(args.channels)
+    nodes_file = Path(args.nodes)
+    results_dir = Path(args.output_dir)
+
     # Verify input files exist
     for file_path in [payments_file, channels_file, nodes_file]:
         if not file_path.exists():
             print(f"Error: File not found: {file_path}")
             return
+
+    results_dir.mkdir(parents=True, exist_ok=True)
     
     print("=" * 60)
     print("Adversary Simulation: Greedy Node Purchase")
