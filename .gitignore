@@ -53,17 +53,12 @@ dkms.conf
 cloth
 payments.csv
 .idea/
-outchannels_output.csv
-outedges_output.csv
-outnodes_output.csv
-outpayments_output.csv
 listchannels20220412.json
 T1_snapshot.json
 
 #Amir files
 .venv
 .DS_Store
-outcloth_output.json
 payments/*
 out/*
 out1/*
