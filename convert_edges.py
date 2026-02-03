@@ -142,19 +142,19 @@ def main() -> None:
     parser.add_argument(
         "--payments",
         type=Path,
-        default=Path("results/outpayments_output1Mil.csv"),
+        default=Path("results/outpayments_output.csv"),
         help="Input payments CSV (route uses edge ids).",
     )
     parser.add_argument(
         "--edges",
         type=Path,
-        default=Path("results/outedges_output1Mil.csv"),
+        default=Path("results/outedges_output.csv"),
         help="Input edges CSV (contains to_node_id).",
     )
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("results/outpayments_output1Mil_nodes.csv"),
+        default=Path("results/outpayments_output_nodes.csv"),
         help="Output payments CSV (route uses intermediate node ids).",
     )
     args = parser.parse_args()
