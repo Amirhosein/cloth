@@ -53,6 +53,7 @@ def _find_payments_nodes_csv(sim_dir: Path) -> Optional[Path]:
         sim_dir / "outpayments_output1Mil_nodes.csv",
         sim_dir / "outpayments_output_nodes.csv",
         sim_dir / "outpayments_output100k_nodes.csv",
+        sim_dir / "outpayments_output_node.csv",
     ]
     for p in preferred:
         if p.exists():
