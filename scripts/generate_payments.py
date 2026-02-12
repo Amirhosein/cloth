@@ -20,12 +20,17 @@ Usage examples:
 
 
     python3 generate_payments.py -n 10000 --min-amount 10000000 --max-amount 100000000 --output payments/payments0.csv
+
+    With capacity-proportional sampling (one endpoint uniform, the other proportional to node capacity):
+    python3 generate_payments.py -n 10000 --min-amount 1000000 --max-amount 50000000 \\
+      --snapshot-dir Cloth/data/T1_snapshot --output payments.csv --amount-colname "amount(millisat)" --distinct-parties --seed 42
 """
 import argparse
 import csv
 import random
 import time
-from typing import List, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Generate a synthetic payments CSV.")
@@ -42,6 +47,16 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Optional path to nodes_ln.csv (with header 'id'). If provided, sender_id/receiver_id will be sampled "
             "from the actual node IDs in this file (optionally filtered by --sender-range/--receiver-range)."
+        ),
+    )
+    p.add_argument(
+        "--snapshot-dir",
+        type=str,
+        default=None,
+        help=(
+            "Optional path to a cloth snapshot directory (nodes_ln.csv + channels_ln.csv). When set, node set and "
+            "per-node capacities are loaded from it and sampling uses: 50%% sender uniform / receiver proportional "
+            "to capacity, 50%% receiver uniform / sender proportional to capacity. Overrides --nodes-file."
         ),
     )
     p.add_argument("--sender-range", type=int, nargs=2, metavar=("MIN", "MAX"), default=[1, 2000], help="Sender id range [MIN, MAX].")
@@ -100,6 +115,80 @@ def read_node_ids(nodes_file: str) -> List[int]:
     # de-dup and sort (stable sampling still uniform via random.choice)
     return sorted(set(ids))
 
+
+def load_snapshot_capacities(
+    snapshot_dir: str,
+    sender_range: Tuple[int, int],
+    receiver_range: Tuple[int, int],
+) -> Tuple[List[int], Dict[int, float]]:
+    """
+    Load node IDs and per-node capacity (half of channel capacity per channel) from a cloth snapshot directory.
+    Expects nodes_ln.csv (id) and channels_ln.csv (node1_id, node2_id, capacity(millisat)).
+    Returns (eligible_node_ids, node_capacity) with eligible set filtered by sender and receiver ranges (intersection).
+    """
+    base = Path(snapshot_dir)
+    nodes_path = base / "nodes_ln.csv"
+    channels_path = base / "channels_ln.csv"
+    if not nodes_path.exists():
+        raise FileNotFoundError(f"Snapshot nodes file not found: {nodes_path}")
+    if not channels_path.exists():
+        raise FileNotFoundError(f"Snapshot channels file not found: {channels_path}")
+
+    node_ids_set = set()
+    with open(nodes_path, "r", newline="") as f:
+        r = csv.DictReader(f)
+        if not r.fieldnames or "id" not in (r.fieldnames or []):
+            raise ValueError(f"nodes_ln.csv must have column 'id' (got {r.fieldnames})")
+        for row in r:
+            v = row.get("id")
+            if v is not None and v != "":
+                node_ids_set.add(int(v))
+
+    node_capacity: Dict[int, float] = {}
+    with open(channels_path, "r", newline="") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            n1 = int(row["node1_id"])
+            n2 = int(row["node2_id"])
+            cap = float(row["capacity(millisat)"])
+            half = cap / 2.0
+            node_capacity[n1] = node_capacity.get(n1, 0.0) + half
+            node_capacity[n2] = node_capacity.get(n2, 0.0) + half
+            node_ids_set.add(n1)
+            node_ids_set.add(n2)
+
+    node_ids = sorted(node_ids_set)
+    sr_lo, sr_hi = sender_range
+    rr_lo, rr_hi = receiver_range
+    eligible = [n for n in node_ids if sr_lo <= n <= sr_hi and rr_lo <= n <= rr_hi]
+    return eligible, node_capacity
+
+
+def _build_weighted_lists(
+    node_ids: Sequence[int],
+    capacity_by_id: Dict[int, float],
+) -> Tuple[List[int], List[float]]:
+    """Build (ids, weights) once for nodes with positive capacity. Reuse for rejection sampling."""
+    ids_w = [n for n in node_ids if (capacity_by_id.get(n) or 0) > 0]
+    weights = [capacity_by_id[n] for n in ids_w]
+    if not ids_w:
+        raise ValueError("No nodes with positive capacity available for weighted choice")
+    return ids_w, weights
+
+
+def _pick_by_capacity(
+    ids_w: List[int],
+    weights: List[float],
+    exclude: Optional[int],
+    max_attempts: int = 2500,
+) -> int:
+    """Pick one node with probability proportional to weights; reject if chosen == exclude (rejection sampling)."""
+    for _ in range(max_attempts):
+        chosen = random.choices(ids_w, weights=weights, k=1)[0]
+        if chosen != exclude:
+            return chosen
+    return ids_w[0]
+
 def validate_args(a: argparse.Namespace) -> None:
     if a.num_payments <= 0:
         raise ValueError("num-payments must be > 0")
@@ -133,7 +222,13 @@ def _party_id_sources(a: argparse.Namespace) -> Tuple[Optional[List[int]], Optio
         raise ValueError(f"No receiver IDs available after filtering nodes-file by receiver-range [{rr_lo}, {rr_hi}]")
     return sender_ids, receiver_ids
 
-def build_rows(a: argparse.Namespace, sender_ids: Optional[Sequence[int]] = None, receiver_ids: Optional[Sequence[int]] = None) -> List[dict]:
+def build_rows(
+    a: argparse.Namespace,
+    sender_ids: Optional[Sequence[int]] = None,
+    receiver_ids: Optional[Sequence[int]] = None,
+    snapshot_node_ids: Optional[Sequence[int]] = None,
+    node_capacity: Optional[Dict[int, float]] = None,
+) -> List[dict]:
     rows = []
     # configure time stepping
     if a.start_mode == "relative":
@@ -157,9 +252,32 @@ def build_rows(a: argparse.Namespace, sender_ids: Optional[Sequence[int]] = None
             current_t += step
             return current_t
 
-    # generate rows
+    use_snapshot = snapshot_node_ids is not None and node_capacity is not None and len(snapshot_node_ids) >= 1
+    eligible_list = list(snapshot_node_ids) if use_snapshot else None
+    cap_map = node_capacity if use_snapshot else None
+    # Precompute weighted list once for capacity-proportional sampling (rejection sampling for exclude)
+    ids_w: Optional[List[int]] = None
+    weights: Optional[List[float]] = None
+    if use_snapshot and eligible_list and cap_map is not None:
+        ids_w, weights = _build_weighted_lists(eligible_list, cap_map)
+
     for i in range(a.num_payments):
-        if sender_ids is not None and receiver_ids is not None:
+        if use_snapshot and eligible_list and ids_w is not None and weights is not None:
+            # 50% sender uniform / receiver proportional; 50% receiver uniform / sender proportional; always distinct
+            if random.random() < 0.5:
+                sender = _pick_from_ids(eligible_list)
+                receiver = _pick_by_capacity(ids_w, weights, exclude=sender)
+            else:
+                receiver = _pick_from_ids(eligible_list)
+                sender = _pick_by_capacity(ids_w, weights, exclude=receiver)
+            if a.distinct_parties and sender == receiver:
+                # should not happen if _pick_by_capacity excludes the other; fallback swap one
+                other = random.choice([n for n in eligible_list if n != sender])
+                if random.random() < 0.5:
+                    sender = other
+                else:
+                    receiver = other
+        elif sender_ids is not None and receiver_ids is not None:
             if a.distinct_parties:
                 sender, receiver = _make_distinct_pair_from_ids(sender_ids, receiver_ids)
             else:
@@ -196,8 +314,39 @@ def main():
     if a.seed is not None:
         random.seed(a.seed)
     validate_args(a)
-    sender_ids, receiver_ids = _party_id_sources(a)
-    rows = build_rows(a, sender_ids=sender_ids, receiver_ids=receiver_ids)
+
+    sender_ids: Optional[List[int]] = None
+    receiver_ids: Optional[List[int]] = None
+    snapshot_node_ids: Optional[List[int]] = None
+    node_capacity: Optional[Dict[int, float]] = None
+
+    if a.snapshot_dir:
+        eligible, node_capacity = load_snapshot_capacities(
+            a.snapshot_dir,
+            tuple(a.sender_range),
+            tuple(a.receiver_range),
+        )
+        if len(eligible) < 2:
+            raise ValueError(
+                f"Snapshot mode requires at least 2 eligible nodes (got {len(eligible)}). "
+                "Check --sender-range and --receiver-range."
+            )
+        nodes_with_capacity = [n for n in eligible if (node_capacity.get(n) or 0) > 0]
+        if len(nodes_with_capacity) < 2:
+            raise ValueError(
+                "Snapshot mode requires at least 2 nodes with positive capacity for proportional sampling."
+            )
+        snapshot_node_ids = eligible
+    else:
+        sender_ids, receiver_ids = _party_id_sources(a)
+
+    rows = build_rows(
+        a,
+        sender_ids=sender_ids,
+        receiver_ids=receiver_ids,
+        snapshot_node_ids=snapshot_node_ids,
+        node_capacity=node_capacity,
+    )
     write_csv(a.output, rows, a.amount_colname)
     print(f"Wrote {len(rows)} rows to: {a.output}")
 
