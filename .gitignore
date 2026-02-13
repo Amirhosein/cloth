@@ -55,6 +55,7 @@ payments.csv
 .idea/
 listchannels20220412.json
 T1_snapshot.json
+T5_snapshot.json
 
 #Amir files
 .venv
