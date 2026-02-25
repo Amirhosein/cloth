@@ -127,6 +127,29 @@ def main() -> None:
         default="Adversary control comparison",
         help="Figure title.",
     )
+    plot_group = p.add_mutually_exclusive_group()
+    plot_group.add_argument(
+        "--btc",
+        action="store_const",
+        const="btc",
+        dest="plot_mode",
+        help="Only generate BTC budget comparison plot.",
+    )
+    plot_group.add_argument(
+        "--perc",
+        action="store_const",
+        const="perc",
+        dest="plot_mode",
+        help="Only generate percentage budget comparison plot.",
+    )
+    plot_group.add_argument(
+        "--all",
+        action="store_const",
+        const="all",
+        dest="plot_mode",
+        default="all",
+        help="Generate both BTC and percentage plots (default).",
+    )
     args = p.parse_args()
 
     # Prevent hard crashes from GUI backends (common on macOS/headless runs):
@@ -170,67 +193,120 @@ def main() -> None:
         if denom <= 0:
             raise ValueError(f"Denominator is 0 for {sim_dir} using {payments_csv}")
 
-        curves_btc.append(build_curve(sim_dir, "btc", denom))
-        curves_pct.append(build_curve(sim_dir, "percent", denom))
+        if args.plot_mode in ("all", "btc"):
+            curves_btc.append(build_curve(sim_dir, "btc", denom))
+        if args.plot_mode in ("all", "perc"):
+            curves_pct.append(build_curve(sim_dir, "percent", denom))
 
     # Styling
     colors = ["#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#ff7f0e", "#17becf"]
     markers = ["o", "s", "^", "D", "v", "P"]
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(17, 6))
+    # Determine subplot layout based on plot mode
+    if args.plot_mode == "all":
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(17, 6))
+        axes = [ax1, ax2]
+    elif args.plot_mode == "btc":
+        fig, ax1 = plt.subplots(1, 1, figsize=(8.5, 6))
+        axes = [ax1]
+        ax2 = None
+    else:  # perc
+        fig, ax2 = plt.subplots(1, 1, figsize=(8.5, 6))
+        axes = [ax2]
+        ax1 = None
+
     fig.suptitle(args.title, fontsize=14, fontweight="bold")
 
     # BTC subplot (log x)
-    ax1.set_xscale("log")
-    ax1.set_xlabel("Budget (BTC)")
-    ax1.set_ylabel("Successful payments covered (%)")
-    ax1.grid(True, alpha=0.25)
+    if ax1 is not None:
+        ax1.set_xscale("log")
+        ax1.set_xlabel("Budget (BTC)")
+        ax1.set_ylabel("Successful payments covered (%)")
+        ax1.grid(True, alpha=0.25)
 
     # Percent subplot (linear x)
-    ax2.set_xlabel("Budget (% of network balance)")
-    ax2.set_ylabel("Successful payments covered (%)")
-    ax2.grid(True, alpha=0.25)
+    if ax2 is not None:
+        ax2.set_xlabel("Budget (% of network balance)")
+        ax2.set_ylabel("Successful payments covered (%)")
+        ax2.grid(True, alpha=0.25)
 
-    for i, (c_btc, c_pct) in enumerate(zip(curves_btc, curves_pct)):
-        color = colors[i % len(colors)]
-        marker = markers[i % len(markers)]
+    # Plot curves
+    if args.plot_mode == "all":
+        for i, (c_btc, c_pct) in enumerate(zip(curves_btc, curves_pct)):
+            color = colors[i % len(colors)]
+            marker = markers[i % len(markers)]
 
-        # Fewer markers for readability on dense curves
-        me_btc = max(1, len(c_btc.x) // 12)
-        me_pct = max(1, len(c_pct.x) // 12)
+            me_btc = max(1, len(c_btc.x) // 12)
+            me_pct = max(1, len(c_pct.x) // 12)
 
-        ax1.plot(
-            c_btc.x,
-            c_btc.y_pct,
-            label=c_btc.label,
-            color=color,
-            linewidth=2.5,
-            marker=marker,
-            markersize=5,
-            markevery=me_btc,
-            alpha=0.9,
-        )
-        ax2.plot(
-            c_pct.x,
-            c_pct.y_pct,
-            label=c_pct.label,
-            color=color,
-            linewidth=2.5,
-            marker=marker,
-            markersize=5,
-            markevery=me_pct,
-            alpha=0.9,
-        )
+            ax1.plot(
+                c_btc.x,
+                c_btc.y_pct,
+                label=c_btc.label,
+                color=color,
+                linewidth=2.5,
+                marker=marker,
+                markersize=5,
+                markevery=me_btc,
+                alpha=0.9,
+            )
+            ax2.plot(
+                c_pct.x,
+                c_pct.y_pct,
+                label=c_pct.label,
+                color=color,
+                linewidth=2.5,
+                marker=marker,
+                markersize=5,
+                markevery=me_pct,
+                alpha=0.9,
+            )
+    elif args.plot_mode == "btc":
+        for i, c_btc in enumerate(curves_btc):
+            color = colors[i % len(colors)]
+            marker = markers[i % len(markers)]
+            me_btc = max(1, len(c_btc.x) // 12)
+            ax1.plot(
+                c_btc.x,
+                c_btc.y_pct,
+                label=c_btc.label,
+                color=color,
+                linewidth=2.5,
+                marker=marker,
+                markersize=5,
+                markevery=me_btc,
+                alpha=0.9,
+            )
+    else:  # perc
+        for i, c_pct in enumerate(curves_pct):
+            color = colors[i % len(colors)]
+            marker = markers[i % len(markers)]
+            me_pct = max(1, len(c_pct.x) // 12)
+            ax2.plot(
+                c_pct.x,
+                c_pct.y_pct,
+                label=c_pct.label,
+                color=color,
+                linewidth=2.5,
+                marker=marker,
+                markersize=5,
+                markevery=me_pct,
+                alpha=0.9,
+            )
 
     # Align y-limits for fair visual comparison
-    ax1.set_ylim(0, 100)
-    ax2.set_ylim(0, 100)
+    if ax1 is not None:
+        ax1.set_ylim(0, 100)
+    if ax2 is not None:
+        ax2.set_ylim(0, 100)
 
-    # One shared legend
-    handles, labels = ax1.get_legend_handles_labels()
-    fig.legend(handles, labels, loc="lower center", ncol=2, frameon=False, bbox_to_anchor=(0.5, -0.02))
+    # Shared legend from the first available axis
+    legend_ax = ax1 if ax1 is not None else ax2
+    if legend_ax is not None:
+        handles, labels = legend_ax.get_legend_handles_labels()
+        fig.legend(handles, labels, loc="lower center", ncol=2, frameon=False, bbox_to_anchor=(0.5, -0.08))
 
-    plt.tight_layout()
+    plt.tight_layout(rect=[0, 0.05, 1, 0.98])
 
     # Resolve output path relative to current working directory
     # (so passing "Cloth/results/..." from repo root works)

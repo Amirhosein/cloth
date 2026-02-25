@@ -63,7 +63,7 @@ python3 "${SCRIPT_DIR}/adversary_simulation.py" \
     --payments "$PAYMENTS_NODE_OUTPUT" \
     --channels "$CHANNELS_FILE" \
     --nodes "$NODES_FILE" \
-    --output-dir "$SIM_DIR_ABS"
+    --output-dir "$SIM_DIR_ABS" --logs
 
 echo ""
 echo "Analysis complete! Results written to: $SIM_DIR_ABS"

@@ -221,6 +221,7 @@ def celf_greedy_selection(
     budget_millisat: float,
     budget_threshold: float = 0.95,
     verbose: bool = False,
+    log_callback=None,
 ) -> Tuple[List[int], int, float]:
     """
     CELF-style greedy selection to maximize covered payments under a budget.
@@ -258,6 +259,7 @@ def celf_greedy_selection(
         )
 
     iterations = 0
+    current_covered = 0
 
     while heap and remaining_budget > 0:
         iterations += 1
@@ -306,6 +308,21 @@ def celf_greedy_selection(
         bought_nodes.append(node_id)
         remaining_budget -= cost
 
+        current_covered += newly_covered
+
+        if log_callback is not None:
+            spent_ratio = (
+                (initial_budget - remaining_budget) / initial_budget if initial_budget > 0 else 0.0
+            )
+            log_callback(
+                node_id=node_id,
+                gain=newly_covered,
+                cost=cost,
+                ratio=new_ratio,
+                covered_so_far=current_covered,
+                spent_ratio=spent_ratio,
+            )
+
         if verbose:
             print(
                 f"[CELF] Iteration {iterations}: bought node {node_id} "
@@ -337,6 +354,7 @@ def run_simulation_btc_budgets(
     payment_paths: List[Tuple[int, int, List[int]]],
     payments_of_node: Dict[int, List[int]],
     node_costs: Dict[int, float],
+    log_writer=None,
 ) -> Tuple[List[float], List[int]]:
     """
     Run simulation with BTC-based budgets sequentially.
@@ -352,9 +370,27 @@ def run_simulation_btc_budgets(
     controls: List[int] = []
     
     for i, (btc_budget, budget_millisat) in enumerate(zip(btc_budgets, budgets_millisat), start=1):
-        print(f"\n[BTC {i}/{len(btc_budgets)}] Starting budget {btc_budget:.6f} BTC "
-              f"(≈ {budget_millisat:,.0f} millisat)")
-        
+        print(
+            f"\n[BTC {i}/{len(btc_budgets)}] Starting budget {btc_budget:.6f} BTC "
+            f"(≈ {budget_millisat:,.0f} millisat)"
+        )
+
+        if log_writer is not None:
+            def log_cb(node_id, gain, cost, ratio, covered_so_far, spent_ratio):
+                log_writer.writerow([
+                    "BTC",
+                    btc_budget,
+                    budget_millisat,
+                    node_id,
+                    gain,
+                    covered_so_far,
+                    cost,
+                    ratio,
+                    spent_ratio,
+                ])
+        else:
+            log_cb = None
+
         bought_nodes, total_covered, remaining_budget = celf_greedy_selection(
             payment_paths,
             payments_of_node,
@@ -362,6 +398,7 @@ def run_simulation_btc_budgets(
             budget_millisat,
             budget_threshold=0.95,
             verbose=False,
+            log_callback=log_cb,
         )
         
         controls.append(total_covered)
@@ -387,6 +424,7 @@ def run_simulation_percentage_budgets(
     payment_paths: List[Tuple[int, int, List[int]]],
     payments_of_node: Dict[int, List[int]],
     node_costs: Dict[int, float],
+    log_writer=None,
 ) -> Tuple[List[float], List[int]]:
     """
     Run simulation with percentage-based budgets sequentially.
@@ -404,9 +442,27 @@ def run_simulation_percentage_budgets(
     for i, (percent_budget, budget_millisat) in enumerate(
         zip(percentage_budgets, budgets_millisat), start=1
     ):
-        print(f"\n[PCT {i}/{len(percentage_budgets)}] Starting budget {percent_budget:.2f}% "
-              f"(≈ {budget_millisat:,.0f} millisat)")
-        
+        print(
+            f"\n[PCT {i}/{len(percentage_budgets)}] Starting budget {percent_budget:.2f}% "
+            f"(≈ {budget_millisat:,.0f} millisat)"
+        )
+
+        if log_writer is not None:
+            def log_cb(node_id, gain, cost, ratio, covered_so_far, spent_ratio):
+                log_writer.writerow([
+                    "PCT",
+                    percent_budget,
+                    budget_millisat,
+                    node_id,
+                    gain,
+                    covered_so_far,
+                    cost,
+                    ratio,
+                    spent_ratio,
+                ])
+        else:
+            log_cb = None
+
         bought_nodes, total_covered, remaining_budget = celf_greedy_selection(
             payment_paths,
             payments_of_node,
@@ -414,6 +470,7 @@ def run_simulation_percentage_budgets(
             budget_millisat,
             budget_threshold=0.95,
             verbose=False,
+            log_callback=log_cb,
         )
         
         controls.append(total_covered)
@@ -512,6 +569,14 @@ def parse_args() -> argparse.Namespace:
         default="results",
         help="Directory for output CSVs and plot (default: results).",
     )
+    p.add_argument(
+        "--logs",
+        action="store_true",
+        help=(
+            "If set, write a detailed log CSV describing which nodes are bought "
+            "for each budget and the gain obtained from each purchase."
+        ),
+    )
     return p.parse_args()
 
 
@@ -521,6 +586,8 @@ def main():
     channels_file = Path(args.channels)
     nodes_file = Path(args.nodes)
     results_dir = Path(args.output_dir)
+    log_file_handle = None
+    log_writer = None
 
     # Verify input files exist
     for file_path in [payments_file, channels_file, nodes_file]:
@@ -529,6 +596,30 @@ def main():
             return
 
     results_dir.mkdir(parents=True, exist_ok=True)
+
+    # Optional detailed logging
+    if args.logs:
+        log_filename = (
+            f"adversary_logs_{payments_file.stem}__"
+            f"{channels_file.stem}__{nodes_file.stem}.csv"
+        )
+        log_path = results_dir / log_filename
+        log_file_handle = open(log_path, "w", newline="")
+        log_writer = csv.writer(log_file_handle)
+        log_writer.writerow(
+            [
+                "budget_type",
+                "budget_value",
+                "budget_millisat",
+                "node_id",
+                "node_gain",
+                "paths_covered_so_far",
+                "node_cost_millisat",
+                "gain_per_cost",
+                "budget_spent_fraction",
+            ]
+        )
+        print(f"\nDetailed node-purchase log will be written to: {log_path}")
     
     print("=" * 60)
     print("Adversary Simulation: Greedy Node Purchase")
@@ -656,6 +747,7 @@ def main():
         payment_paths,
         payments_of_node,
         node_costs,
+        log_writer=log_writer,
     )
     
     percent_budgets_result, percent_controls = run_simulation_percentage_budgets(
@@ -668,6 +760,7 @@ def main():
         payment_paths,
         payments_of_node,
         node_costs,
+        log_writer=log_writer,
     )
     
     # Generate plots (as percentage of successful payments covered)
@@ -702,6 +795,9 @@ def main():
             writer.writerow([budget, control])
     print(f"Saved percentage results to {percent_output_file}")
     
+    if log_file_handle is not None:
+        log_file_handle.close()
+
     print("\n" + "=" * 60)
     print("Simulation Complete!")
     print("=" * 60)

@@ -1,0 +1,329 @@
+\documentclass{article}
+\usepackage{graphicx} % Required for inserting images
+\usepackage{amssymb, amsmath}
+\usepackage{booktabs}
+\usepackage{url}
+
+
+\title{The Cost of Centralization in Lightning Routing}
+\author{Amirhosein Iravanimanesh and Majid Khabbazian}
+\date{February 2026}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+The Lightning Network (LN) exhibits pronounced structural skew: a small subset of nodes lies on a large share of routes under common shortest-path proxies, and recent measurement studies report that such centrality increases over time.  Yet structural inequality alone does not quantify \emph{capturability}: how expensive it is for an adversary to obtain meaningful influence over routed payments.
+We study LN centralization through a budget-aware lens that couples (i) a \emph{routing-policy--faithful} simulation of payment paths with (ii) an explicit economic cost model for compromising routing nodes.
+Using CLoTH, a Lightning simulator derived from \texttt{lnd} code, we drive one-million-payment experiments on historical gossip-derived snapshots spanning 2018--2023 and generate payment endpoints under both uniform demand and capacity-weighted demand.
+We then formulate the adversary as a budgeted maximum-coverage problem over successful payment traces: given a budget (in BTC), select a set of intermediate nodes to maximize the fraction of successful payment paths covered.
+To scale the selection step to million-payment traces we implement a lazy greedy strategy (CELF) that preserves greedy solution quality while reducing redundant marginal-gain computations by orders of magnitude.
+Empirically, we find that budget-aware capture curves can diverge sharply from purely structural metrics (e.g., Gini of betweenness): later snapshots may appear more centralized under shortest-path centrality, yet be substantially harder to capture under liquidity-proportional costs.
+These results argue for reporting decentralization as a \emph{budget-impact curve}---not a single inequality statistic---when assessing LN routing risk.
+\end{abstract}
+
+\section{Introduction}
+
+Payment channel networks (PCNs) such as Bitcoin's Lightning Network (LN) route payments off-chain over a graph of bilateral channels, improving throughput and latency while retaining on-chain security guarantees. However, LN's decentralization is not determined only by the existence of many nodes and channels; it depends critically on \emph{who} is used as an intermediary in practice. If a small set of routing nodes repeatedly lies on a large fraction of successful payment routes, the system inherits familiar risks: single points of failure, concentrated fee-setting power, and amplified privacy and censorship exposure to on-path adversaries.
+
+\paragraph{Centralization is measurable---and already visible in deployed snapshots.}
+Recent measurement work has quantified a strong skew in LN's routing topology. In particular, Zabka \emph{et al.} reconstruct historical LN snapshots from gossip and study the distribution of fee-weighted betweenness centrality as well as its inequality via the Gini index, finding that a limited set of nodes accounts for a significant share of routes and that centralization increases over time~\cite{zabka2024centrality}. They also show that multi-part payments can increase the centrality of already central nodes, further motivating a careful discussion of routing policies and their decentralization implications~\cite{zabka2024centrality}.
+
+\paragraph{Why ``shortest-path centrality'' is not the whole story.}
+A subtle but crucial point is that \emph{centralization is routing-policy dependent}. Much prior work (including the betweenness--Gini analysis above) uses (fee-weighted) \emph{shortest paths} as a proxy for routing behavior~\cite{zabka2024centrality}. This is a reasonable first-order model, but LN payments are routed by \emph{client implementations} that embed production heuristics, constraints, and reliability considerations, and different clients can realize materially different pathfinding strategies.
+
+This motivates a natural question for AFT-style evaluation: if we care about decentralization \emph{in practice}, which routing policy should our metrics reflect? Importantly, measurement studies report that \texttt{lnd} (Lightning Network Daemon) constitutes the majority of public LN nodes (mid-80\% share in measured datasets), making its routing policy the de facto baseline for much of the deployed network~\cite{zabka2022empirical,zabka2024centrality}. Accordingly, in this paper we evaluate centralization under a \emph{practical routing policy} by driving route selection using LND's routing behavior (as used in our simulations), and we compare against the common shortest-path proxy.
+
+\paragraph{A missing dimension: centrality versus \emph{capturability}.}
+Even with a realistic routing model, classical centrality metrics remain largely \emph{descriptive}: they quantify skew (e.g., via betweenness inequality), but they do not directly answer an operational security question:
+\begin{quote}
+\emph{How expensive is it for a resource-limited adversary to obtain meaningful influence over routed payments?}
+\end{quote}
+This question matters for surveillance, censorship, and targeted disruption threat models. Moreover, structural concentration and practical exploitability can diverge: a topology may look highly centralized yet be \emph{economically hard} to capture if the critical intermediaries are costly to acquire; conversely, a less obviously centralized topology may admit low-cost coalitions that jointly cover a large share of routes.
+
+\paragraph{Our lens: budget-aware routing centrality under a chosen policy.}
+We introduce a budget-aware metric suite that treats centralization as a \emph{budgeted capture problem}. Let $G=(V,E)$ be an LN snapshot, let $\mathcal{R}$ denote a routing policy (in our evaluation, LND's routing policy), and let $c:V\rightarrow\mathbb{R}_{\ge 0}$ assign a cost to capturing node $v$ (e.g., liquidity-proportional cost, per-operator overhead, or a hybrid).
+For a set $S\subseteq V$, define its routing-policy--aware group coverage as
+\[
+\mathrm{RBC}_{\mathcal{R}}(S)=\frac{1}{\Lambda}\sum_{s,t}D_{st}\sum_{p\in\mathcal{P}_{st}}\pi_{st}(p)\,\mathbf{1}\{p\cap S\neq\emptyset\},
+\quad \Lambda=\sum_{s,t}D_{st},
+\]
+where $D_{st}$ is a traffic weight and $\pi_{st}(p)$ is the probability that routing policy $\mathcal{R}$ selects path $p$ for $(s,t)$.
+Our primary object is the \emph{budget-impact curve}
+\[
+F(B)\;=\;\max_{\substack{S\subseteq V\\ \sum_{v\in S}c(v)\le B}}\ \mathrm{RBC}_{\mathcal{R}}(S),
+\]
+i.e., the maximum fraction of routed volume a budget-$B$ adversary can intercept as an \emph{intermediate} hop.
+We summarize $F(B)$ via interpretable statistics such as $B_\alpha=\min\{B:\,F(B)\ge\alpha\}$ (budget to capture $\alpha$ of routed volume) and ``budgeted Nakamoto-style'' coefficients that measure how many (or how costly) nodes suffice to reach a target capture level.
+
+\paragraph{Why this is new and orthogonal.}
+Our work is related to group notions of centrality (e.g., group betweenness) and to routing-aware betweenness variants, but it differs in two key ways. First, we elevate the problem from ranking nodes to measuring \emph{centralization under budget}, i.e., an explicit optimization under costs. Second, we make the metric \emph{policy-faithful}: rather than relying on shortest-path proxies, we evaluate under a production routing policy (LND) that dominates the deployed network. This adds an economic and operational axis---\emph{capturability as a function of adversarial budget under the routing policy actually used}---that complements snapshot-based inequality analyses.
+
+\paragraph{Contributions.}
+\begin{itemize}
+  \item \textbf{Budget-aware centralization metric.} We formalize budget-aware routing centrality via the budget-impact curve $F(B)$ and derived summary measures ($B_\alpha$, amplification relative to proportional baselines, and budgeted Nakamoto-style coefficients).
+  \item \textbf{Policy realism (new relative to shortest-path analyses).} We instantiate the metric under a practical LN routing policy by using LND's routing behavior in our simulations, and we compare against the standard fee-weighted shortest-path proxy commonly used in betweenness-based LN centrality studies.
+  \item \textbf{Threat-modelled costs.} We evaluate multiple node cost models (liquidity-based, operator-based, and hybrids) to map different adversarial capabilities into concrete capture budgets.
+  \item \textbf{Orthogonal insight.} We show that structural/flow centralization and economic capture-resistance can diverge sharply, and that both axes are needed to evaluate routing policies and decentralization claims in LN.
+\end{itemize}
+
+\paragraph{Roadmap.}
+We next define the adversary and cost models, describe how we generate routing distributions under LND, present scalable estimators and algorithms for approximating $F(B)$, and report an empirical study on LN snapshots comparing routing-policy choices through the lens of budget-aware centralization.
+
+
+
+
+
+
+\section{Data and Snapshot Construction}
+\label{sec:data}
+
+\subsection{Gossip-derived topology snapshots}
+Our experiments rely on public Lightning gossip archives that record announced channels, policy updates, and node metadata over time.
+Following the methodology popularized by Zabka \emph{et al.}~\cite{zabka2024centrality}, we obtain historical snapshots by reconstructing the public channel graph from gossip and applying consistency checks to produce a self-contained multigraph with node annotations and per-node adjacency lists.
+Concretely, we use tooling and datasets in the \texttt{lnresearch/topology} ecosystem~\cite{lnresearchTopology} (and auxiliary snapshot-extraction utilities such as \texttt{lntopo}) to materialize snapshot graphs.
+
+\subsection{Snapshot selection and naming}
+To capture longitudinal trends without overfitting to a single point in time, we select four representative snapshots spanning 2018--2023, which we denote:
+\textbf{T1} (early network), \textbf{T5} (intermediate), \textbf{T11} (April 2022), and \textbf{T12} (June 2023, the latest month available in the chosen gossip dataset).
+Each snapshot is stored as a JSON graph (node list plus per-node adjacency lists), and then converted into CLoTH's CSV input schema (Section~\ref{sec:conversion}).
+
+\begin{table}[t]
+\centering
+\caption{Snapshot sizes used in our study (derived from the converted CLoTH inputs).}
+\label{tab:snapshot-sizes}
+\begin{tabular}{lrr}
+\toprule
+Snapshot & \#Nodes & \#Channels \\
+\midrule
+T1  & 1{,}361  & 3{,}263 \\
+T5  & 5{,}905  & 29{,}869 \\
+T11 & 18{,}358 & 81{,}348 \\
+T12 & 15{,}290 & 64{,}704 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Why we de-emphasize betweenness--Gini.}
+Prior centrality work commonly reports inequality in shortest-path betweenness via the Gini index~\cite{zabka2024centrality}.
+While useful as a descriptive statistic, we deliberately de-emphasize Gini as a primary security metric in this study for three reasons.
+First, it is \emph{routing-policy dependent}: different LN clients (and even different weight heuristics within the same client) can realize materially different path distributions, so a shortest-path-based Gini can mischaracterize the exposure of real traffic.
+Second, it is \emph{cost-agnostic}: an extremely skewed distribution can still be economically hard to capture if dominant intermediaries are expensive, while a modest skew can be highly capturable if the critical set is cheap.
+Third, as a single scalar, Gini compresses tail structure and provides limited guidance for operational questions such as ``What budget is required to intercept 10\% or 50\% of routed payments?''.
+Our budget-impact curve $F(B)$ (Section~\ref{sec:adversary}) is designed to answer exactly that.
+
+\section{CLoTH Simulator and Execution Model}
+\label{sec:cloth}
+
+\subsection{Simulator overview}
+CLoTH is a discrete-event payment-channel network simulator that re-implements core Lightning routing and HTLC mechanics, with the explicit design goal of reproducing \texttt{lnd} behavior~\cite{conoscenti2021cloth}.
+The version used in our experiments is based on \texttt{lnd-v0.10.0-beta}, consistent with CLoTH's stated implementation target.
+It takes as input (i) a network snapshot in CSV form (nodes/channels/edges) and (ii) a payments workload (either synthetic or from file), and produces both per-payment traces and aggregate statistics in \texttt{cloth\_output.json}.
+We use CLoTH in ``network-from-file'' and ``payments-from-file'' modes, making the routing policy and network constraints explicit and reproducible.
+
+\subsection{Retry window and attempts}
+LN path finding is inherently uncertain because channel \emph{balances} are private even though channel \emph{capacities} are public~\cite{poon2016lightning}.
+CLoTH models this uncertainty through repeated path attempts: a payment increments an attempt counter each time a route is (re)computed, and gives up once the simulator time exceeds a fixed retry window.
+In the current code path (\texttt{Cloth/src/htlc.c}), a payment times out if
+\[
+t_{\mathrm{now}} > t_{\mathrm{start}} + 60{,}000\text{ ms},
+\]
+i.e., the retry budget is one minute of simulated time.
+Moreover, multi-path payment splitting (MPP) is attempted only on the first attempt, reflecting a pragmatic trade-off between reliability and computational cost in large trace runs.
+These design choices make million-payment experiments feasible while preserving the qualitative structure of the routing uncertainty problem.
+
+\subsection{Compute environment}
+All simulations and post-processing were run on a commodity workstation with the following configuration:
+Intel Core i7-7700 (8 logical cores), 48~GiB RAM, Ubuntu 24.04.1 LTS (kernel 6.17.0-14-generic), and 256~GB disk.
+
+\section{Snapshot-to-Simulator Conversion Pipeline}
+\label{sec:conversion}
+
+\subsection{CLoTH input schema}
+CLoTH consumes three network files (\texttt{nodes\_ln.csv}, \texttt{channels\_ln.csv}, \texttt{edges\_ln.csv}) and a payments file (\texttt{payments.csv})~\cite{conoscenti2021cloth}.
+Channels are modeled as bidirectional pairs of directed edges, each with per-direction forwarding policy (base fee, proportional fee, minimum HTLC, and timelock).
+Our conversion scripts enforce CLoTH's expectations: contiguous 0-based node IDs, exactly two directed edges per channel (with \texttt{counter\_edge\_id} pointers), and consistent channel/edge references.
+
+\subsection{From \texttt{listchannels} snapshots}
+For snapshots obtained as a \texttt{listchannels}-style dataset (a list of per-direction channel announcements), we use \texttt{Cloth/scripts/clothify.py} to convert JSON records into the required CSV schema.
+This path preserves short channel IDs and advertised policies, and initializes per-direction balances by an equal split of channel capacity (a standard modeling assumption when balances are unknown).
+
+\subsection{From gossip-graph snapshots (T1/T5/T11/T12)}
+Gossip-derived graph snapshots are structurally different: they contain a node list and a per-node \texttt{adjacency} field, where \texttt{adjacency[i]} is the list of outgoing edge announcements for node~$i$.
+We implement a dedicated converter, \texttt{Cloth/scripts/clothify\_t1.py}, which:
+(i) optionally reformats minified one-line JSON for tool compatibility,
+(ii) flattens the adjacency list-of-lists,
+(iii) normalizes field names (e.g., \texttt{fee\_proportional\_millionths}, \texttt{cltv\_expiry\_delta}, and the dataset typo \texttt{htlc\_minimim\_msat}),
+and (iv) emits CLoTH-ready CSVs and mapping files.
+This converter is the bridge from the Zabka/TimeMachine-style snapshot representation~\cite{zabka2024centrality} to a routing-policy--faithful simulator.
+
+\section{Payment Workloads}
+\label{sec:payments}
+
+\subsection{Uniform endpoints}
+Our baseline workload samples sender and receiver uniformly at random from the set of nodes in the snapshot, conditioned on sender $\neq$ receiver.
+This model appears frequently in prior LN simulation work as a conservative ``uninformed demand'' assumption.
+
+\subsection{Capacity-weighted endpoint sampling}
+To model heterogeneous demand (e.g., exchanges, merchants, and hubs initiating or receiving more traffic), we also generate workloads that bias one endpoint by node capacity.
+Let $\tau(u)$ denote the total (unknown) liquidity controlled by node~$u$ across its incident channels.
+Since balances are private, we approximate $\tau(u)$ by the expected local balance under an equal-split assumption:
+\[
+\tau(u) \approx \sum_{e \in \Gamma(u)} \frac{c(e)}{2},
+\]
+where $c(e)$ is channel capacity and $\Gamma(u)$ is the set of channels adjacent to $u$.
+This is the same demand proxy used in recent LN economic simulations~\cite{carotti2023rational}.
+
+Our ``weighted'' endpoint model is intentionally asymmetric to avoid unrealistically concentrating both endpoints on the largest hubs:
+with probability $1/2$ we sample the sender uniformly and sample the receiver with probability proportional to $\tau(\cdot)$; with probability $1/2$ we swap roles.
+We implement this generator in \texttt{Cloth/scripts/generate\_payments.py} via a \texttt{--snapshot-dir} mode that reads \texttt{nodes\_ln.csv} and \texttt{channels\_ln.csv}, computes per-node $\tau(u)$, and performs capacity-proportional draws.
+For efficiency at one-million-payment scale, the weighted sampler precomputes the global weight vector once and uses rejection sampling to enforce endpoint distinctness.
+
+\section{Route Extraction and Preprocessing}
+\label{sec:preprocess}
+
+CLoTH writes per-payment traces in \texttt{outpayments\_output.csv}, including an \texttt{is\_success} flag and a \texttt{route} field.
+A subtle but important implementation detail is that CLoTH's route serialization uses \emph{edge IDs} rather than node IDs.
+Because our adversary analysis is node-centric (compromise routing \emph{nodes}, not directed edges), we convert traces using \texttt{Cloth/scripts/convert\_edges.py}, which maps each edge hop to its destination node and retains only \emph{intermediate} nodes (dropping the receiver if present as the final hop).
+We automate the conversion-plus-analysis workflow with \texttt{Cloth/scripts/run\_adversary\_analysis.sh}.
+
+\section{Budgeted Adversary Model}
+\label{sec:adversary}
+
+\subsection{Threat model and objective}
+We consider an economically constrained adversary who can compromise routing nodes (e.g., by acquiring operators, deploying coercion, or purchasing liquidity service).
+Given a set of successful payments $\mathcal{P}$, let each payment $p \in \mathcal{P}$ define a set of intermediate nodes $I(p) \subseteq V$ (excluding sender and receiver endpoints).
+For a compromised set $S \subseteq V$, we say payment $p$ is \emph{covered} if $I(p)\cap S \neq \emptyset$.
+Our primary control metric is therefore:
+\[
+\mathrm{cover}(S) \;=\; \frac{1}{|\mathcal{P}|}\sum_{p\in\mathcal{P}} \mathbf{1}\{I(p)\cap S \neq \emptyset\},
+\]
+i.e., the fraction of successful payments whose routed interior is observed or controlled by the adversary.
+
+\subsection{Cost model and budgets}
+We assign a cost to compromising node~$v$ proportional to its initial liquidity proxy: $c(v)=\tau(v)$ in millisatoshis, computed from \texttt{channels\_ln.csv} by summing half-capacity over incident channels (Section~\ref{sec:payments}).
+Budgets are specified in BTC and converted via $1\,\mathrm{msat}=10^{-11}\,\mathrm{BTC}$ (as in our analysis scripts).
+In our experiments we sweep budgets on a log-spaced grid between 0.01 and 20~BTC (with configurable resolution) and write the resulting budget--control pairs to \texttt{adversary\_control\_btc.csv} (and analogously percentage-budget curves where used).
+This liquidity-proportional model is not the only plausible cost metric, but it is transparent, reproducible, and captures the intuition that high-throughput routing nodes are expensive to ``buy'' in a realistic threat model.
+
+\section{Algorithms for Budgeted Capture}
+\label{sec:algorithms}
+
+\subsection{Optimization problem}
+Maximizing covered payments under a budget is a variant of \emph{budgeted maximum coverage}, equivalently monotone submodular maximization under a knapsack constraint.
+The problem is NP-hard; classical greedy algorithms achieve constant-factor approximations, and for related submodular objectives there are well-known $(1-1/e)$-type guarantees under cardinality constraints~\cite{nemhauser1978analysis} and constant-factor guarantees under knapsack constraints~\cite{sviridenko2004submodular}.
+Our goal here is not to re-prove these results, but to implement an empirically effective and scalable approximation that can be evaluated on million-payment traces.
+
+\subsection{Na{\"i}ve greedy and its bottleneck}
+Our initial prototype followed an intuitive strategy: iteratively select the ``best'' affordable node by recomputing its marginal gain (additional payments covered) at each step and updating coverage after each purchase.
+When na{\"i}vely implemented over million-payment traces, this requires repeated full scans of the payment set and becomes prohibitively slow.
+This motivated a representation shift: rather than recomputing coverage by rescanning the entire trace, we precompute a node--payment incidence structure.
+
+\subsection{CELF lazy greedy}
+We implement a CELF-style lazy greedy strategy~\cite{leskovec07cost} in \texttt{Cloth/scripts/adversary\_simulation.py}.
+Let $\mathcal{U}=\{0,\ldots,|\mathcal{P}|-1\}$ index successful payments. For each node $v$, define the set $A(v)\subseteq \mathcal{U}$ of payment indices whose intermediate route contains $v$.
+We precompute $A(v)$ once via a single pass over the trace, yielding a sparse incidence map \texttt{payments\_of\_node}.
+The greedy objective is to maximize the number of covered indices; at each iteration we choose a node with high marginal gain per unit cost.
+
+CELF maintains a priority queue keyed by an upper bound on each node's current marginal gain-to-cost ratio and lazily recomputes exact marginal gain only when a node reaches the top of the queue.
+Because coverage only increases over time, marginal gains are non-increasing, making this lazy evaluation safe.
+In practice, CELF substantially reduces redundant gain recomputations compared to eager greedy, enabling budget curves to be computed over dozens of budget levels on million-payment traces within practical runtimes on commodity hardware.
+
+\paragraph{Complexity.}
+Let $m=|\mathcal{P}|$ be the number of successful payments and let $T=\sum_{v\in V}|A(v)|$ be the total node--payment incidence (the total number of intermediate-node occurrences across all routes).
+We build \texttt{payments\_of\_node} in $O(T)$ time and store it in $O(T)$ space, alongside a length-$m$ boolean array indicating which payments are already covered.
+An exact marginal-gain recomputation for node $v$ costs $O(|A(v)|)$ by scanning its incident payment indices and counting uncovered entries; CELF reduces the number of such recomputations by exploiting the diminishing-marginal-gain property.
+
+\section{Experimental Results}
+\label{sec:results}
+
+\subsection{Payment success and routing dynamics}
+Table~\ref{tab:cloth-stats} summarizes the aggregate success rates and routing dynamics produced by CLoTH on our four snapshots under both workload models (uniform and weighted).
+We report the success probability, the two dominant failure modes (no path vs no balance), and average route length.
+CLoTH also outputs confidence intervals (via batch-means estimation) for these quantities; we omit intervals in the table for readability and focus on mean behavior.
+
+\begin{table}[t]
+\centering
+\caption{CLoTH aggregate outcomes for one-million-payment experiments (means from \texttt{outcloth\_output.json}).}
+\label{tab:cloth-stats}
+\begin{tabular}{llrrrr}
+\toprule
+Snapshot & Workload & Success & NoPath & NoBalance & RouteLen \\
+\midrule
+T1  & uniform  & 0.702 & 0.125 & 0.173 & 4.105 \\
+T1  & weighted & 0.686 & 0.193 & 0.121 & 3.587 \\
+T5  & uniform  & 0.930 & 0.041 & 0.029 & 3.199 \\
+T5  & weighted & 0.877 & 0.048 & 0.076 & 2.553 \\
+T11 & uniform  & 0.866 & 0.070 & 0.064 & 3.356 \\
+T11 & weighted & 0.779 & 0.092 & 0.128 & 2.509 \\
+T12 & uniform  & 0.938 & 0.034 & 0.028 & 3.530 \\
+T12 & weighted & 0.890 & 0.041 & 0.069 & 2.822 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Observation.}
+Across snapshots, uniform workloads tend to achieve higher success than weighted workloads.
+Capacity-weighted endpoint selection increases the likelihood of involving large nodes, which can reduce path diversity and amplify local balance constraints under repeated attempts.
+These effects motivate studying adversary capture under both workload models rather than assuming uniform demand.
+
+\subsection{Budget-impact curves and adversary control}
+Figures~\ref{fig:adv-uniform} and~\ref{fig:adv-weighted} report the budget-impact curves $F(B)$ for the four snapshots under uniform and weighted workloads, respectively.
+Each curve plots the fraction of \emph{successful} payments whose intermediate route contains at least one compromised node, as a function of budget~$B$ (BTC).
+All curves are computed using the same liquidity-proportional node costs and the same CELF-accelerated greedy selection algorithm.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{../results/compare_T1_T5_T11_T12_u_btc.png}
+\caption{Budget-impact curves under \emph{uniform} endpoint sampling.}
+\label{fig:adv-uniform}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{../results/compare_T5_T1_T11_T12_w_btc.png}
+\caption{Budget-impact curves under \emph{capacity-weighted} endpoint sampling.}
+\label{fig:adv-weighted}
+\end{figure}
+
+\paragraph{Key trend: early snapshots are dramatically more capturable.}
+Under uniform demand, the T1 snapshot is highly vulnerable: at $B=0.01$~BTC the greedy adversary already covers 25{,}288 successful paths, and by $B=20$~BTC it covers 673{,}925 paths (97.7\% of the 689{,}744 successful payments in the trace).
+In contrast, the latest snapshot (T12) remains far less capturable under the same budget: at $B=20$~BTC it covers 285{,}943 paths (30.6\% of 933{,}219).
+The intermediate snapshots T5 and T11 lie between these extremes.
+
+\paragraph{Weighted demand changes \emph{who} is exposed.}
+Under capacity-weighted workloads, later snapshots become even harder to capture in our experiments (e.g., T12 reaches only 14.9\% coverage at $B=20$~BTC), while T1 remains strongly capturable (92.5\% at $B=20$~BTC).
+This indicates that ``centralization'' is not a single scalar property: traffic models and routing constraints reshape the effective exposure surface, and budget-aware capture curves are sensitive to these modeling choices.
+
+\subsection{Revisiting Gini: inequality versus capturability}
+Our results provide a concrete reason to be cautious when interpreting betweenness-Gini trends as security conclusions.
+If a later snapshot exhibits higher inequality in shortest-path centrality, that does not necessarily imply that a budgeted adversary can cheaply intercept a large share of \emph{real} routed payments.
+Liquidity concentration can simultaneously increase apparent centrality and increase the economic cost of compromising the dominant hubs, yielding a network that is structurally skewed but capture-resistant under realistic budgets.
+Budget-impact curves therefore complement (rather than replace) structural inequality statistics: they expose the operational trade-off between concentration and cost, and make explicit how much influence an adversary can buy.
+
+\section{Limitations and Future Work}
+\label{sec:limitations}
+
+Our study has limitations that suggest clear next steps.
+First, we evaluate static snapshots and synthetic workloads; extending to time-evolving graphs with churn and online learning of failure probabilities would improve fidelity.
+Second, our node-compromise cost is liquidity-proportional; alternative cost models (operator costs, multi-node ownership, partial compromise of channels, or hybrid costs) may shift capture curves.
+Third, we focus on a mixed uniform/weighted endpoint model; exploring fully capacity-proportional sender and receiver selection would align more directly with some economic-demand models.
+Finally, while CELF makes greedy practical, there is room to incorporate stronger knapsack-submodular approximation schemes and to quantify approximation error empirically for this domain.
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+Centralization in Lightning routing is not only a matter of who is structurally central, but also how expensive it is to capture the intermediaries that dominate routed traffic under the routing policy and workload in question.
+By combining an \texttt{lnd}-faithful simulator (CLoTH) with a budgeted capture formulation and a scalable CELF-accelerated greedy algorithm, we obtain interpretable budget-impact curves across historical snapshots.
+These curves reveal that structural inequality metrics such as betweenness-Gini can be misleading when used in isolation: they ignore routing-policy realism, traffic models, and the economics of compromising hubs.
+Budget-aware capture curves provide a practical complementary lens for evaluating LN routing risk and decentralization claims.
+
+\clearpage
+
+\bibliographystyle{splncs04}
+\bibliography{References}
+
+
+
+\end{document}

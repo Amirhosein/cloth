@@ -1,0 +1,46 @@
+\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[margin=1in]{geometry}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{amssymb}
+
+\title{Research Progress and TODO List}
+
+\begin{document}
+
+\maketitle
+
+\section*{Timeline and Tasks}
+
+\begin{description}[style=nextline, font=\bfseries\color{blue}]
+    \item[Jan 19] 
+    \begin{itemize}
+        \item First and last snapshot review. \checkmark
+        \item Greedy BTC and share of the whole network. \checkmark
+    \end{itemize}
+
+    \item[Feb 5] 
+    \begin{itemize}
+        \item Gini factor discussion.
+        \item Different ways to generate src and dst payments. \checkmark
+        \item Different snapshots. \checkmark
+        \item Agent for LN nodes (Another research project).
+    \end{itemize}
+
+    \item[Feb 19] 
+    \begin{itemize}
+        \item Recent snapshot, clients, "how-to-get-new-snapshots."
+        \item Analysis of "the jump in the uniform payments."
+        \item Analysis of "10Mil vs 1Mil payments effects."
+        \item \textbf{Problem Formulation:} Input node numbers, link graphs, list of paths, and number of nodes to be chosen.
+        \item \textbf{Complexity Notes:} 
+        \begin{itemize}
+            \item Linear graph $\rightarrow$ Polynomial.
+            \item Complete graph $\rightarrow$ NP-Hard.
+            \item \textit{Question:} What about a Tree?
+        \end{itemize}
+    \end{itemize}
+\end{description}
+
+\end{document}
