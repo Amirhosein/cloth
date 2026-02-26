@@ -70,3 +70,5 @@ out7/*
 cloth_input.txt
 data/T1/payments_proportional_10Mil.csv
 data/T1/payments_u_10Mil.csv
+
+results/*
